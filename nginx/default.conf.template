@@ -1,0 +1,23 @@
+# Редактор + прокси к серверу проверки: запросы /checker/... уходят на CHECKER_URL.
+# Так кнопка «Отправить» работает из браузера без настроек CORS на сервере.
+server {
+    listen 80;
+    root /usr/share/nginx/html;
+    client_max_body_size 200m;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # Метка для редактора: «прокси к серверу проверки есть»
+    location = /checker-proxy.json {
+        default_type application/json;
+        return 200 '{"proxy": true}';
+    }
+
+    location /checker/ {
+        proxy_pass ${CHECKER_URL}/;
+        proxy_set_header Host $proxy_host;
+        proxy_read_timeout 300s;
+    }
+}

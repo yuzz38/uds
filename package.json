@@ -1,0 +1,13 @@
+{
+  "name": "uds-editor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Редактор графа УДС: .osm → правки на карте → .osm для MatSim, SUMO и Webots",
+  "scripts": {
+    "test": "node tests/osm.test.js",
+    "start": "python3 -m http.server 8090"
+  },
+  "devDependencies": {
+    "@xmldom/xmldom": "0.8.10"
+  }
+}

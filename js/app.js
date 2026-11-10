@@ -103,6 +103,12 @@
     view: "class",
   };
 
+  // append/replaceChildren без «null» в тексте: необязательные блоки панели возвращают null
+  for (const m of ["append", "replaceChildren"]) {
+    const orig = Element.prototype[m];
+    Element.prototype[m] = function (...kids) { return orig.apply(this, kids.filter((k) => k != null && k !== false)); };
+  }
+
   const $ = (sel) => document.querySelector(sel);
   const el = (tag, attrs, ...kids) => {
     const e = document.createElement(tag);
@@ -123,6 +129,18 @@
   const map = L.map("map", { preferCanvas: true, doubleClickZoom: false, zoomControl: true, maxZoom: 21, boxZoom: false })
     .setView([52.2603, 104.2621], 16);
   const renderer = L.canvas({ padding: 0.5, tolerance: COARSE ? 14 : 6 });
+  // кружки проблем — на своём слое поверх дорог, чтобы клик всегда попадал в них
+  map.createPane("issuesPane").style.zIndex = 450;
+  // SVG, а не холст: у холста на весь экран клики не проходят к дорогам под ним,
+  // а SVG ловит клик только на самих кружках
+  const issueRenderer = L.svg({ pane: "issuesPane", padding: 0.5 });
+  // светофоры, переходы, остановки — тоже поверх дорог, иначе перерисованная дорога «закрывает» их от клика
+  map.createPane("pointsPane").style.zIndex = 440;
+  const pointRenderer = L.svg({ pane: "pointsPane", padding: 0.5 });
+  // зона доступности рисуется непрозрачно на своём слое, а прозрачен весь слой — без тёмных наложений
+  const accessPane = map.createPane("accessPane");
+  accessPane.style.zIndex = 390; accessPane.style.opacity = "0.38"; accessPane.style.pointerEvents = "none";
+  const accessRenderer = L.canvas({ pane: "accessPane", padding: 0.5 });
   // Подпись библиотеки без флажка (по умолчанию Leaflet 1.8+ добавляет его к своей ссылке)
   map.attributionControl.setPrefix('<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
 
@@ -171,7 +189,8 @@
       maxNativeZoom: 19, maxZoom: 21, attribution: "© участники OpenStreetMap" }),
     "Без подложки": L.layerGroup(),
   };
-  bases["2ГИС"].addTo(map);
+  // По умолчанию — Яндекс: 2ГИС отдаёт тайлы без официального API и может перестать отвечать
+  bases["Яндекс спутник"].addTo(map);
 
   const g = {
     other: L.layerGroup().addTo(map),
@@ -182,6 +201,12 @@
     roads: L.layerGroup().addTo(map),
     arrows: L.layerGroup().addTo(map),
     nodes: L.layerGroup().addTo(map),
+    lanes: L.layerGroup().addTo(map),
+    restr: L.layerGroup().addTo(map),
+    transit: L.layerGroup(),
+    access: L.layerGroup(),
+    relief: L.layerGroup(),
+    traj: L.layerGroup().addTo(map),
     ped: L.layerGroup().addTo(map),
     diff: L.layerGroup().addTo(map),
     measure: L.layerGroup().addTo(map),
@@ -200,6 +225,12 @@
     "Здания": g.buildings,
     "Прочее": g.other,
     "Проблемы": g.issues,
+    "Полосы и стрелки (крупный масштаб)": g.lanes,
+    "Запреты манёвров (знаки из файла)": g.restr,
+    "Маршруты общественного транспорта": g.transit,
+    "Доступность остановок": g.access,
+    "Рельеф (горизонтали)": g.relief,
+    "Траектории манёвров": g.traj,
     "Пешеходный поток": g.ped,
     "Изменения": g.diff,
   }, { collapsed: true, position: "topright" }).addTo(map);
@@ -269,7 +300,8 @@
     if (cat === "other") return { color: "#a5d8ff", weight: 1, fillOpacity: 0.1, opacity: 0.5 };
     const [, classWeight] = CLASS_STYLE[w.tags.highway] || ["#868e96", 3];
     const c = roadColor(w);
-    const st = { color: c.color, weight: laneWeight(w, classWeight), opacity: 0.92, lineCap: "round", dashArray: c.dash || null };
+    const detail = map.getZoom() >= 18 && map.hasLayer(g.lanes);
+    const st = { color: c.color, weight: detail ? 5 : laneWeight(w, classWeight), opacity: detail ? 0.35 : 0.92, lineCap: "round", dashArray: c.dash || null };
     if (w.tags.bridge && w.tags.bridge !== "no") st.color = shade(st.color);
     if (w.tags.tunnel && w.tags.tunnel !== "no") st.dashArray = "4 6";
     return st;
@@ -404,7 +436,7 @@
       crossing: { radius: 3.5, color: "#212529", weight: 1, fillColor: "#fff", fillOpacity: 1 },
       stop: { radius: 4, color: "#fff", weight: 1.5, fillColor: "#1971c2", fillOpacity: 1 },
     }[kind];
-    const m = L.circleMarker(ll(n), Object.assign({ renderer, bubblingMouseEvents: false }, style));
+    const m = L.circleMarker(ll(n), Object.assign({ renderer: pointRenderer, pane: "pointsPane", bubblingMouseEvents: false }, style));
     m.on("click", (e) => {
       if (state.mode === "signal") return onSignalClick(e.latlng);
       if (state.mode === "crossing") return onCrossingClick(e.latlng);
@@ -423,11 +455,37 @@
     for (const w of state.doc.ways.values()) if (category(w) === "roads") drawArrows(w);
   });
 
+  // Запреты манёвров из файла (отношения restriction) — знаки на подъезде
+  const RESTR_SIGN = {
+    no_left_turn: ["3.18.2 Поворот налево запрещён", "no", "left"], no_right_turn: ["3.18.1 Поворот направо запрещён", "no", "right"],
+    no_u_turn: ["3.19 Разворот запрещён", "no", "u"], no_straight_on: ["Движение прямо запрещено", "no", "straight"],
+    only_straight_on: ["4.1.1 Движение прямо", "only", "straight"], only_left_turn: ["4.1.3 Движение налево", "only", "left"],
+    only_right_turn: ["4.1.2 Движение направо", "only", "right"], only_u_turn: ["Только разворот", "only", "u"],
+  };
+  function restrictionSvg(kind) {
+    const [, type, dir] = RESTR_SIGN[kind] || ["", "no", "straight"];
+    const arrow = { left: '<path d="M13 15V9H7" fill="none" stroke="C" stroke-width="2.2"/><path d="M8 6L4.5 9 8 12z" fill="C"/>',
+      right: '<path d="M7 15V9h6" fill="none" stroke="C" stroke-width="2.2"/><path d="M12 6l3.5 3-3.5 3z" fill="C"/>',
+      straight: '<path d="M10 16V7" stroke="C" stroke-width="2.2"/><path d="M6.5 8L10 3.5 13.5 8z" fill="C"/>',
+      u: '<path d="M12 15V8a3 3 0 0 0-6 0v3" fill="none" stroke="C" stroke-width="2.2"/><path d="M3.5 10L6 14 8.5 10z" fill="C"/>' }[dir];
+    if (type === "only") return `<svg width="20" height="20" viewBox="0 0 20 20"><circle cx="10" cy="10" r="9" fill="#1c7ed6" stroke="#fff"/>${arrow.replace(/C/g, "#fff")}</svg>`;
+    return `<svg width="20" height="20" viewBox="0 0 20 20"><circle cx="10" cy="10" r="8.5" fill="#fff" stroke="#e03131" stroke-width="2.5"/>${arrow.replace(/C/g, "#000")}<path d="M4 16L16 4" stroke="#e03131" stroke-width="2.2"/></svg>`;
+  }
+  function drawRestrictions() {
+    g.restr.clearLayers();
+    if (!state.doc) return;
+    for (const r of state.doc.restrictions()) {
+      L.marker([r.lat, r.lon], { icon: L.divIcon({ className: "sign-icon", html: restrictionSvg(r.kind), iconSize: [20, 20] }), zIndexOffset: 250 })
+        .bindTooltip(`${(RESTR_SIGN[r.kind] || [r.kind])[0]} — из файла (отношение ${r.id}); SUMO это учитывает`).addTo(g.restr);
+    }
+  }
+
   function drawAll() {
     for (const grp of Object.values(g)) grp.clearLayers();
     wayLayers.clear(); arrowLayers.clear(); nodeLayers.clear();
     for (const id of state.doc.ways.keys()) drawWay(id);
     for (const id of state.doc.nodes.keys()) drawNode(id);
+    drawRestrictions();
   }
 
   // ---------------------------------------------------------------------------
@@ -458,8 +516,12 @@
     doc.on(onDocChange);
     const empty = document.querySelector(".empty-state");
     if (empty) empty.remove();
+    transit.shown.clear(); transit.access = null; transit.heights = null; transit.relief = null;
+    g.transit.clearLayers(); g.access.clearLayers(); g.relief.clearLayers();
     drawAll();
     fitDoc();
+    scheduleLanes();
+    notifyMissing();
     fillStreetNames();
     runValidation();
     renderPanel();
@@ -532,7 +594,7 @@
     runValidation();
     const errors = state.issues.filter((i) => i.severity === "error").length;
     if (errors && !confirm(`Проверка нашла ${errors} ${plural(errors, "ошибку", "ошибки", "ошибок")} графа (вкладка «Проблемы»). ` +
-        "На сервере они дадут обрывы и телепортации. Всё равно сохранить?")) {
+        "Прогон на сервере, скорее всего, пройдёт, но эти места будут работать в симуляции неправильно. Всё равно сохранить?")) {
       showTab("issues");
       return;
     }
@@ -592,6 +654,9 @@
     scheduleAutosave();
     if (activeTab() === "changes") renderChanges();
     refresh3d();
+    scheduleLanes();
+    drawRestrictions();
+    if (map.hasLayer(g.transit)) drawTransit();
   }
 
   let validationTimer = null;
@@ -607,9 +672,11 @@
     state.issuesFresh = true;
     g.issues.clearLayers();
     for (const is of state.issues) {
+      // кружок на карте кликабелен — открывает объяснение проблемы
       L.circleMarker([is.lat, is.lon], {
-        renderer, radius: 9, color: is.severity === "error" ? "#c92a2a" : "#e67700", weight: 3, fill: false, interactive: false,
-      }).addTo(g.issues);
+        renderer: issueRenderer, pane: "issuesPane", radius: 10, color: is.severity === "error" ? "#c92a2a" : "#e67700", weight: 3,
+        fill: true, fillOpacity: 0.08, bubblingMouseEvents: false,
+      }).on("click", (e) => { L.DomEvent.stop(e); focusIssue(is, true); }).addTo(g.issues);
     }
     const errors = state.issues.filter((i) => i.severity === "error").length;
     $("#issues-count").textContent = errors ? String(errors) : "";
@@ -773,7 +840,7 @@
     document.querySelectorAll(".modes button").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
     const c = map.getContainer();
     c.classList.toggle("mode-draw", mode === "draw");
-    c.classList.toggle("mode-signal", mode === "signal" || mode === "sign" || mode === "crossing" || mode === "measure");
+    c.classList.toggle("mode-signal", mode === "signal" || mode === "sign" || mode === "crossing" || mode === "measure" || mode === "stop");
     if (mode === "draw") state.draw = { points: [] };
     // В панели инструментов — выбор подходящий к режиму: шаблон, знак или тип перехода
     $("#tpl-group").hidden = !(mode === "select" || mode === "draw");
@@ -791,6 +858,7 @@
     if (state.mode === "sign") return onSignClick(e.latlng);
     if (state.mode === "crossing") return onCrossingClick(e.latlng);
     if (state.mode === "measure") return onMeasureClick(e.latlng);
+    if (state.mode === "stop") return onStopClick(e.latlng);
     select({ type: "way", id });
   }
 
@@ -801,6 +869,7 @@
     if (state.mode === "sign") return onSignClick(e.latlng);
     if (state.mode === "crossing") return onCrossingClick(e.latlng);
     if (state.mode === "measure") return onMeasureClick(e.latlng);
+    if (state.mode === "stop") return onStopClick(e.latlng);
     select(null);
   });
 
@@ -1072,6 +1141,7 @@
     if (name === "help") renderHelp();
     if (name === "changes") renderChanges();
     if (name === "ped") renderPed();
+    if (name === "ot") renderOt();
   }
   document.querySelectorAll(".tabs button").forEach((b) => b.addEventListener("click", () => {
     showTab(b.dataset.tab);
@@ -1148,8 +1218,12 @@
         el("b", {}, "Как править. "),
         "Кликните дорогу — справа появятся её атрибуты, на карте — узлы. Тащите узел, чтобы сдвинуть; бросьте на другой узел — получится перекрёсток. ",
         "Режим «Дорога» (N) рисует новую, «Светофор» (T) ставит светофор кликом."),
+      el("h3", {}, "Не хватает данных"),
+      missingBlock(),
       el("h3", {}, "Автозаполнение пропусков"),
       autofillBlock(),
+      el("h3", {}, "Знаки приоритета по данным"),
+      signsBlock(),
       el("h3", {}, "Пешеходы — массово"),
       el("div", { class: "actions" },
         el("button", { onclick: () => bulk("пешеходам нельзя на магистралях", (w) => isDrivable(w) && MAJOR.has(w.tags.highway) && !w.tags.foot, "foot", "no"),
@@ -1160,6 +1234,34 @@
       el("h3", {}, "Легенда — " + VIEWS[state.view].toLowerCase()),
       legend(),
     );
+  }
+
+  // Знаки «Уступите дорогу» / «Главная дорога» на нерегулируемых перекрёстках — по классам дорог,
+  // по тому же правилу, по которому SUMO сам расставляет приоритеты
+  function signsBlock() {
+    const res = el("p", { class: "small" });
+    let plan = null;
+    const show = () => {
+      plan = state.doc.suggestSigns({ main: withMain.checked });
+      g.diff.clearLayers();
+      for (const sg of plan) {
+        L.marker([sg.lat, sg.lon], { interactive: false, opacity: 0.75,
+          icon: L.divIcon({ className: "sign-icon", html: signSvg(sg.kind === "main" ? "main" : "give_way", { tags: {} }), iconSize: [20, 20] }) }).addTo(g.diff);
+      }
+      const gw = plan.filter((x) => x.kind === "give_way").length;
+      res.textContent = plan.length ? `Предлагается: «Уступите дорогу» — ${gw}, «Главная дорога» — ${plan.length - gw}. Показаны полупрозрачными на карте.` : "Все нерегулируемые перекрёстки уже со знаками.";
+      put.disabled = !plan.length;
+    };
+    const put = el("button", { class: "primary", disabled: true, onclick: () => {
+      const n = run("знаки приоритета по данным", () => state.doc.placeSigns(plan));
+      g.diff.clearLayers(); put.disabled = true;
+      toast(`Поставлено знаков: ${n}. Отменить — Ctrl+Z`);
+    } }, "Расставить");
+    const withMain = el("input", { type: "checkbox" });
+    return el("div", {},
+      el("p", { class: "muted small" }, "На нерегулируемых перекрёстках разных по классу дорог: второстепенным подъездам — 2.4 «Уступите дорогу» (выезды из дворов пропускаются, ПДД 8.3), по желанию главным — 2.1. SUMO сам определяет приоритет так же, по классу дорог; знаки делают это видимым и записывают в файл по правилам OSM."),
+      el("div", { class: "checks" }, el("label", {}, withMain, "и «Главная дорога» на главных")),
+      el("div", { class: "actions" }, el("button", { onclick: show }, "Показать"), put), res);
   }
 
   const MAJOR = new Set(["motorway", "trunk", "primary", "secondary", "motorway_link", "trunk_link", "primary_link", "secondary_link"]);
@@ -1254,6 +1356,8 @@
       form.append(...field("Уровень (layer)", textInput(t.layer, (v) => tag("layer", v), { type: "number", min: -5, max: 5, title: "Мосты +1 и выше, тоннели −1" })));
       box.append(form);
       box.append(el("h3", {}, "Полосы"), lanesEditor(w));
+      const turns = turnLanesEditor(w);
+      if (turns) box.append(turns);
       box.append(el("div", { class: "checks" },
         check("Мост", t.bridge && t.bridge !== "no", (on) => run(on ? "мост" : "не мост", () => {
           const tags = { ...w.tags };
@@ -1362,6 +1466,8 @@
         el("button", { class: "danger", onclick: () => { run("удалить узел", () => doc.deleteNode(n.id)); select(w && doc.ways.has(w.id) ? { type: "way", id: w.id } : null); }, title: "Delete" }, "Удалить узел"),
       ),
       el("p", { class: "muted small" }, "Чтобы соединить дороги, перетащите узел на узел другой дороги. Alt при перетаскивании — без прилипания."),
+      tlsEditor(n),
+      maneuversBlock(n),
       el("h3", {}, "Все теги"), tagTable("node", n),
     );
   }
@@ -1399,6 +1505,7 @@
     isolated: "Изолированные куски", deadend: "Односторонние тупики", gap: "Разорванные перекрёстки",
     crossing: "Пересечения без перекрёстка", bridge: "Мосты без уровня",
     trap: "Ловушки (нельзя выехать)", glued: "Склеенные перекрёстки", direction: "Неверные направления",
+    signal_approach: "Светофоры на подходах", tls: "Программы светофоров",
   };
 
   function renderIssues() {
@@ -1412,12 +1519,12 @@
       el("span", {}, "Предупреждений: ", el("b", { class: warns ? "warn" : "ok" }, warns)),
       el("button", { onclick: () => { runValidation(); renderIssues(); } }, "Проверить заново")));
     box.append(el("p", { class: "muted small" },
-      "Проверяются только дороги для машин — по ним MatSim строит маршруты, а SUMO пускает машины. Концы дорог у края фрагмента не считаются тупиками. Список обновляется после каждой правки."));
+      "Проверяются дороги для машин — по ним MatSim строит маршруты, а SUMO пускает машины. Красное — ошибки карты, жёлтое — «проверьте»: тупики и односторонние въезды во дворах бывают нормой, их можно отметить кнопкой «Это нормально» (тег noexit=yes). Концы дорог у края фрагмента не считаются тупиками."));
     if (!state.issues.length) { box.append(el("p", {}, "Граф связный, ошибок не найдено.")); return; }
     let lastType = null;
     for (const is of state.issues) {
       if (is.type !== lastType) { box.append(el("h3", {}, ISSUE_TITLES[is.type] || is.type)); lastType = is.type; }
-      box.append(el("div", { class: "issue " + is.severity },
+      box.append(el("div", { class: "issue " + is.severity, "data-idx": state.issues.indexOf(is) },
         el("p", {}, is.message),
         el("div", { class: "actions" },
           el("button", { onclick: () => focusIssue(is) }, "Показать"),
@@ -1425,24 +1532,72 @@
           is.fix ? el("button", { class: "primary", onclick: () => {
             run("исправить: " + (ISSUE_TITLES[is.type] || is.type), () => state.doc.applyFix(is.fix));
             runValidation(); renderIssues();
-          } }, "Исправить") : null)));
+          } }, (is.fix && is.fix.label) || "Исправить") : null)));
     }
   }
 
-  function focusIssue(is) {
-    map.setView([is.lat, is.lon], Math.max(map.getZoom(), 18));
-    if (is.ways && is.ways.length) select({ type: "way", id: is.ways[0] });
-    else if (is.nodes && is.nodes.length) select({ type: "node", id: is.nodes[0], way: (state.doc.waysOfNode(is.nodes[0])[0] || {}).id });
+  // Объяснения проблем: что это, чем грозит, что делать
+  const ISSUE_HELP = {
+    gap: ["Конец дороги в паре метров от другой дороги, но не соединён с ней.", "Машины не могут проехать с одной дороги на другую — маршрут обрывается.", "«Исправить» соединит их в перекрёсток. Если в реальности проезда нет — удалите лишний хвост."],
+    glued: ["Мост или тоннель имеет общий узел с дорогой другого уровня посередине пролёта.", "В Webots машины «спрыгивают» с моста на дорогу под ним, в SUMO появляется несуществующий перекрёсток.", "«Исправить» отделит дорогу от моста. Проверьте в 3D."],
+    crossing: ["Две дороги пересекаются на карте, но общего узла нет, и это не мост и не тоннель.", "Перекрёстка нет — машины проезжают «сквозь» друг друга.", "Если это перекрёсток — «Исправить». Если путепровод — отметьте у верхней дороги «Мост»."],
+    bridge: ["У моста не указан уровень (layer).", "В Webots мост окажется на одном уровне с дорогой под ним.", "«Исправить» поставит layer=1."],
+    isolated: ["Кусок сети не связан с остальными дорогами.", "Машины туда не попадут — участок выпадает из модели.", "Соедините с ближайшей улицей. Если это двор без въезда с улицы на этой карте — «Это нормально»."],
+    deadend: ["На односторонней дороге можно въехать, но нельзя выехать (или наоборот).", "Участок выпадает из маршрутов: ни одна машина по нему не поедет.", "Проверьте направление движения. Во дворе такое бывает в реальности — тогда «Это нормально»."],
+    trap: ["Участок из нескольких улиц, из которого с учётом направлений нельзя выехать (или в который нельзя въехать).", "Машины в нём не ездят — SUMO отбрасывает такие поездки.", "Проверьте направления на подсвеченных улицах. Во дворе — «Это нормально»."],
+    direction: ["Части одной улицы — односторонние навстречу друг другу.", "Поток упирается в точку, где обе части сходятся.", "Разверните одну из частей (клавиша R)."],
+    signal_approach: ["Светофор стоит на точке перед перекрёстком, а не на самом перекрёстке.", "SUMO сделает отдельный светофор посреди дороги, а перекрёсток останется нерегулируемым.", "«Перенести на перекрёсток» — светофор встанет на узел перекрёстка."],
+    tls: ["Программа светофора не сходится с перекрёстком.", "Подъезд без зелёного: машины стоят до телепортации.", "Откройте перекрёсток и добавьте подъезд в одну из фаз."],
+  };
+
+  let issuePopup = null;
+  function focusIssue(is, fromMap) {
+    if (!fromMap) map.setView([is.lat, is.lon], Math.max(map.getZoom(), 18));
+    // подсветить всё, что относится к проблеме
+    g.sel.clearLayers(); g.handles.clearLayers();
+    const doc = state.doc;
+    for (const id of is.ways || []) {
+      const w = doc.ways.get(id);
+      if (!w) continue;
+      L.polyline(w.nodes.map((n) => ll(doc.nodes.get(n))), { renderer, color: is.severity === "error" ? "#e03131" : "#f08c00", weight: 12, opacity: 0.45, interactive: false }).addTo(g.sel);
+    }
+    for (const id of is.nodes || []) {
+      const n = doc.nodes.get(id);
+      if (n) L.circleMarker(ll(n), { renderer, radius: 7, color: "#212529", weight: 2, fillColor: "#fff", fillOpacity: 1, interactive: false }).addTo(g.sel);
+    }
+    const help = ISSUE_HELP[is.type] || [is.message, "", ""];
+    const box = el("div", { class: "issue-pop" },
+      el("p", { class: "issue-pop-type " + is.severity }, (is.severity === "error" ? "Ошибка: " : "Проверьте: ") + (ISSUE_TITLES[is.type] || is.type)),
+      el("p", {}, is.message),
+      help[1] ? el("p", {}, el("b", {}, "Чем грозит. "), help[1]) : null,
+      help[2] ? el("p", {}, el("b", {}, "Что делать. "), help[2]) : null,
+      (is.ways || []).length ? el("p", { class: "small muted" }, "Затронуто: " + is.ways.slice(0, 4).map((id) => doc.ways.get(id)).filter(Boolean).map(label).join(", ") + (is.ways.length > 4 ? ` и ещё ${is.ways.length - 4}` : "")) : null,
+      el("div", { class: "actions" },
+        is.fix ? el("button", { class: "primary", onclick: () => {
+          run((is.fix.label || "исправить") + ": " + (ISSUE_TITLES[is.type] || is.type), () => state.doc.applyFix(is.fix));
+          map.closePopup(); runValidation(); if (activeTab() === "issues") renderIssues();
+        } }, is.fix.label || "Исправить") : null,
+        el("button", { onclick: () => { map.closePopup(); open3d({ lat: is.lat, lon: is.lon }); } }, "В 3D"),
+        is.ways && is.ways.length ? el("button", { onclick: () => { map.closePopup(); select({ type: "way", id: is.ways[0] }); } }, "К дороге") : null));
+    issuePopup = L.popup({ maxWidth: 340, minWidth: 260, autoPanPadding: [40, 40] }).setLatLng([is.lat, is.lon]).setContent(box).openOn(map);
+    // открыть список проблем и выделить эту
     showTab("issues");
-    const ring = L.circleMarker([is.lat, is.lon], { renderer, radius: 22, color: "#f2b705", weight: 4, fill: false, interactive: false }).addTo(g.sel);
-    setTimeout(() => ring.remove(), 1500);
+    if (isMobile() && document.body.classList.contains("sheet-collapsed")) setSheet("half");
+    const idx = state.issues.indexOf(is);
+    const item = document.querySelector(`#tab-issues .issue[data-idx="${idx}"]`);
+    if (item) {
+      document.querySelectorAll("#tab-issues .issue.active").forEach((x) => x.classList.remove("active"));
+      item.classList.add("active");
+      item.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
   }
 
   // ----- справка -----
 
-  function renderHelp() {
+  function renderHelp(force) {
     const box = $("#tab-help");
-    if (box.childElementCount) return;
+    if (box.childElementCount && !force) return;
+    box.replaceChildren();
     const keys = [
       ["V", "Режим выбора и правки"], ["N", "Нарисовать дорогу (клики по карте, Enter или двойной клик — готово)"],
       ["T", "Светофор: клик по узлу или дороге"], ["S", "Дорожный знак"], ["P", "Пешеходный переход"], ["M", "Линейка"], ["3", "3D-просмотр видимой области"], ["R", "Развернуть выбранную дорогу"], ["X", "Разрезать дорогу в выбранном узле"],
@@ -1455,7 +1610,10 @@
     box.append(
       el("h2", {}, "Редактор графа УДС"),
       el("p", {}, "Открывает .osm, показывает дорожную сеть на карте, даёт править её мышью и сохраняет обратно в .osm — тот же формат, который на сервере проверки читают MatSim, SUMO и Webots."),
-      el("h3", {}, "Горячие клавиши"), t,
+      el("h3", {}, "Горячие клавиши — можно переназначить"),
+      el("p", { class: "muted small" }, "Нажмите на клавишу справа от действия, затем новую. Работает в любой раскладке. Сохраняется в браузере."),
+      keysBlock(),
+      el("p", { class: "muted small" }, "Постоянные: Delete — удалить, Enter/Backspace/Esc — при рисовании, Ctrl+Z/Y — отмена/повтор, Ctrl+S — сохранить, Ctrl+O — открыть."),
       el("h3", {}, "Приёмы"),
       el("ul", {},
         el("li", {}, "Новая дорога, начатая или законченная на существующей дороге, сразу соединяется с ней (оранжевая точка)."),
@@ -1464,6 +1622,790 @@
         el("li", {}, "Подложку можно сменить в правом верхнем углу карты (2ГИС, спутник, OSM), прозрачность — ползунком сверху."),
         el("li", {}, "Перед сохранением граф проверяется; ошибки видны на вкладке «Проблемы» и красными кругами на карте.")),
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Полосы и стрелки на крупном масштабе (в метрах — совпадает со спутником)
+  // ---------------------------------------------------------------------------
+
+  const LANES_ZOOM = 17;
+  const LANE_M = 3.2;
+  const DEFAULT_LANES = { motorway: 4, trunk: 4, primary: 4, secondary: 2, tertiary: 2, unclassified: 2, residential: 2, living_street: 1, service: 1, road: 2 };
+
+  /** Локальные метры вокруг точки и обратно. */
+  function meters(lat0) {
+    const kx = Math.cos((lat0 * Math.PI) / 180) * 111320, ky = 110540;
+    return {
+      to: (n, o) => ({ x: (n.lon - o.lon) * kx, y: (n.lat - o.lat) * ky }),
+      back: (p, o) => [o.lat + p.y / ky, o.lon + p.x / kx],
+    };
+  }
+
+  function lanesSplitUi(w) {
+    const l = state.doc.lanesOf(w);
+    const hw = (w.tags.highway || "").replace("_link", "");
+    const base = DEFAULT_LANES[hw] || 1;
+    if (onewayDir(w) !== 0) return { f: l.total || ((w.tags.highway || "").endsWith("_link") ? 1 : Math.max(1, Math.ceil(base / 2))), b: 0, known: !!l.total };
+    let f = l.forward, b = l.backward;
+    if (f == null || b == null) { const t = l.total || base; f = Math.max(1, Math.ceil(t / 2)); b = Math.max(t - f, t > 1 ? 1 : 0); }
+    return { f, b, known: l.known };
+  }
+
+  /** Смещённые линии с правильными стыками; off — число или смещение для каждой точки. */
+  function offsetLine(pts, off) {
+    const out = [];
+    const offAt = (i) => (Array.isArray(off) ? off[i] : off);
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)], p = pts[i];
+      const n1 = i > 0 ? nrm(p, pts[i - 1]) : nrm(b, p), n2 = i < pts.length - 1 ? nrm(pts[i + 1], p) : n1;
+      let mx = n1.x + n2.x, my = n1.y + n2.y; const ml = Math.hypot(mx, my) || 1; mx /= ml; my /= ml;
+      const k = Math.min(1 / Math.max(mx * n1.x + my * n1.y, 0.35), 1.6); // без острых «шипов» на крутых изгибах
+      out.push({ x: p.x + mx * k * offAt(i), y: p.y + my * k * offAt(i) });
+    }
+    return out;
+    function nrm(q, p) { const dx = q.x - p.x, dy = q.y - p.y, l = Math.hypot(dx, dy) || 1; return { x: -dy / l, y: dx / l }; }
+  }
+
+  /** Точка и направление на ломаной в dist метрах от начала (или от конца, если fromEnd). */
+  function along(pts, dist, fromEnd) {
+    const P = fromEnd ? [...pts].reverse() : pts;
+    let left = dist;
+    for (let i = 1; i < P.length; i++) {
+      const a = P[i - 1], b = P[i], seg = Math.hypot(b.x - a.x, b.y - a.y);
+      if (seg >= left || i === P.length - 1) {
+        const t = seg ? Math.min(1, left / seg) : 0;
+        const ux = (b.x - a.x) / (seg || 1), uy = (b.y - a.y) / (seg || 1);
+        // направление движения в сторону конца линии
+        return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, ux: fromEnd ? -ux : ux, uy: fromEnd ? -uy : uy };
+      }
+      left -= seg;
+    }
+    return null;
+  }
+
+  /** Стрелка разметки в локальной системе: u — вдоль движения, v — влево. Возвращает ломаные. */
+  function arrowGlyph(value) {
+    const parts = new Set((value || "").split(";").filter(Boolean).map(window.OSM.turnClass));
+    const lines = [[[-2.4, 0], [0.4, 0]]];
+    if (parts.has("through")) lines.push([[0.4, 0], [2.4, 0]], [[1.5, 0.7], [2.4, 0], [1.5, -0.7]]);
+    if (parts.has("left")) lines.push([[0.2, 0], [0.9, 1.4]], [[0.1, 1.3], [0.9, 1.4], [1.1, 0.6]]);
+    if (parts.has("right")) lines.push([[0.2, 0], [0.9, -1.4]], [[0.1, -1.3], [0.9, -1.4], [1.1, -0.6]]);
+    if (parts.has("reverse")) lines.push([[0.4, 0], [0.9, 0.6], [0.4, 1.2], [-0.6, 1.2]], [[-0.1, 1.7], [-0.6, 1.2], [-0.1, 0.7]]);
+    return parts.size ? lines : [];
+  }
+
+  function drawLanesDetail() {
+    g.lanes.clearLayers();
+    if (!state.doc || map.getZoom() < LANES_ZOOM || !map.hasLayer(g.lanes)) return;
+    const doc = state.doc;
+    const view = map.getBounds().pad(0.2);
+    const c = map.getCenter();
+    const M = meters(c.lat), O = { lat: c.lat, lon: c.lng };
+    const junction = (id) => doc.waysOfNode(id).filter(isDrivable).length > 1;
+    for (const w of doc.ways.values()) {
+      if (!isDrivable(w)) continue;
+      const nodes = w.nodes.map((id) => doc.nodes.get(id));
+      if (!nodes.some((n) => view.contains([n.lat, n.lon]))) continue;
+      const raw = nodes.map((n) => M.to(n, O));
+      const cs = doc.crossSection(w);
+      const { f, b, known, laneW } = cs;
+      const half = cs.width / 2;
+      // плавный переход ширины к продолжению дороги (3 полосы → 2 — сужение, а не ступенька)
+      const startT = doc.endProfile(w, false), endT = doc.endProfile(w, true);
+      const dn = window.OSM.densify(raw, 25, 4, "x", "y");
+      const pts = dn.pts;
+      const taper = Math.min(25, dn.total * 0.45);
+      const prof = dn.dist.map((s) => window.OSM.taperProfile(s, dn.total - s, cs, startT, endT, taper));
+      const L_ = prof.map((p) => p.left), R_ = prof.map((p) => p.right), A_ = prof.map((p) => p.axis);
+      const toLL = (line) => line.map((p) => M.back(p, O));
+      const left = offsetLine(pts, L_), right = offsetLine(pts, R_);
+      L.polygon(toLL([...left, ...right.reverse()]), { renderer, stroke: false, fillColor: "#2b2f34", fillOpacity: 0.55, interactive: false }).addTo(g.lanes);
+      const edge = { renderer, color: "#f1f3f5", weight: 1.5, opacity: 0.9, interactive: false };
+      L.polyline(toLL(offsetLine(pts, L_.map((v) => v - 0.3))), edge).addTo(g.lanes);
+      L.polyline(toLL(offsetLine(pts, R_.map((v) => v + 0.3))), edge).addTo(g.lanes);
+      const axis = half - b * laneW;
+      const dash = { renderer, color: "#f1f3f5", weight: 1.2, opacity: 0.85, dashArray: "6 9", interactive: false };
+      if (b > 0) L.polyline(toLL(offsetLine(pts, A_)), { renderer, color: "#fcc419", weight: 2.5, opacity: 0.95, interactive: false }).addTo(g.lanes);
+      // разделители полос идут от оси с шагом в полосу и не выходят за кромку — исчезающая полоса сходит на нет
+      for (let k = 1; k < b; k++) L.polyline(toLL(offsetLine(pts, A_.map((a, i) => Math.min(a + k * laneW, L_[i] - 0.3)))), dash).addTo(g.lanes);
+      for (let k = 1; k < f; k++) L.polyline(toLL(offsetLine(pts, A_.map((a, i) => Math.max((b ? a : L_[i]) - k * laneW, R_[i] + 0.3)))), dash).addTo(g.lanes);
+      if (!known && state.view === "lanes") {
+        // число полос не указано — помечаем только в раскраске «по числу полос», чтобы не загромождать
+        const total = pts.reduce((t, p, i) => (i ? t + Math.hypot(p.x - pts[i - 1].x, p.y - pts[i - 1].y) : 0), 0);
+        const mid = along(pts, total / 2, false);
+        if (mid) L.marker(M.back(mid, O), { interactive: false, icon: L.divIcon({ className: "lane-unknown", html: "?", iconSize: [16, 16] }) }).addTo(g.lanes);
+      }
+      // стрелки: у конца линии для полос «туда», у начала — для полос «обратно»
+      const sides = onewayDir(w) < 0 ? [["backward", b + f, true]] : [["forward", f, false], ["backward", b, true]];
+      for (const [side, count, atStart] of sides) {
+        if (!count) continue;
+        const endId = atStart ? w.nodes[0] : w.nodes[w.nodes.length - 1];
+        if (!junction(endId) && doc.nodes.get(endId).tags.highway !== "traffic_signals") continue;
+        if (map.getZoom() < 18) continue; // стрелки — с масштаба 18, на 17 они нечитаемы
+        let turns = doc.turnLanes(w, onewayDir(w) !== 0 ? "forward" : side);
+        let inferred = false;
+        if (!turns.some(Boolean)) { turns = doc.defaultTurnLanes(w, onewayDir(w) !== 0 ? "forward" : side); inferred = true; }
+        const at = along(pts, 9, !atStart);
+        if (!at) continue;
+        // движение на этих полосах — к концу линии (forward) или к началу (backward)
+        const ux = atStart ? -at.ux : at.ux, uy = atStart ? -at.uy : at.uy;
+        const vx = -uy, vy = ux;
+        turns.forEach((t, i) => {
+          if (!t) return;
+          const off = side === "forward" || onewayDir(w) !== 0 ? (b ? axis : half) - (i + 0.5) * laneW : axis + (i + 0.5) * laneW;
+          // смещение off — влево от направления рисования; для встречных полос «влево» водителя — к оси
+          const nx = -at.uy, ny = at.ux; // нормаль влево от направления рисования
+          const cx = at.x + nx * off, cy = at.y + ny * off;
+          for (const line of arrowGlyph(t)) {
+            L.polyline(line.map(([u, v]) => M.back({ x: cx + (ux * u + vx * v) * 1.5, y: cy + (uy * u + vy * v) * 1.5 }, O)),
+              { renderer, color: inferred ? "#ffe066" : "#ffffff", weight: 2, opacity: inferred ? 0.6 : 0.95, dashArray: inferred ? "2 3" : null, interactive: false }).addTo(g.lanes);
+          }
+        });
+      }
+    }
+  }
+
+  let lanesTimer = null;
+  function scheduleLanes() { clearTimeout(lanesTimer); lanesTimer = setTimeout(() => { drawLanesDetail(); drawTrajectories(); }, 120); }
+  let lastZoomBand = null;
+  map.on("zoomend", () => {
+    const band = map.getZoom() >= LANES_ZOOM;
+    if (state.doc && band !== lastZoomBand) {
+      // на крупном масштабе линии по классу бледнеют, чтобы читались полосы
+      for (const w of state.doc.ways.values()) if (category(w) === "roads") drawWay(w.id);
+      lastZoomBand = band;
+    }
+  });
+  map.on("moveend zoomend", scheduleLanes);
+
+  // ---------------------------------------------------------------------------
+  // Траектории манёвров на перекрёстках и конфликтные точки
+  // ---------------------------------------------------------------------------
+
+  const TRAJ_COLORS = { left: "#e8590c", through: "#495057", right: "#1c7ed6", reverse: "#ae3ec9" };
+  const TRAJ_NAMES = { left: "налево", through: "прямо", right: "направо", reverse: "разворот" };
+  state.showTraj = false;
+
+  function junctionTrajectories(nodeId, M, O) {
+    const doc = state.doc, n = doc.nodes.get(nodeId);
+    const C = M.to(n, O);
+    const dir = (deg) => ({ x: Math.sin((deg * Math.PI) / 180), y: Math.cos((deg * Math.PI) / 180) });
+    const curves = [];
+    for (const mv of doc.movements(nodeId)) {
+      if (!mv.allowed) continue;
+      const a = dir(mv.from.bearing), bq = dir(mv.to.bearing);
+      // въезд: справа от направления движения к центру (−a), выезд — справа от направления от центра (b)
+      const P0 = { x: C.x + a.x * 14 + (-a.y) * -1.8, y: C.y + a.y * 14 + (a.x) * -1.8 };
+      const P2 = { x: C.x + bq.x * 14 + bq.y * 1.8, y: C.y + bq.y * 14 - bq.x * 1.8 };
+      const pts = [];
+      for (let t = 0; t <= 1.0001; t += 1 / 14) {
+        const u = 1 - t;
+        pts.push({ x: u * u * P0.x + 2 * u * t * C.x + t * t * P2.x, y: u * u * P0.y + 2 * u * t * C.y + t * t * P2.y });
+      }
+      curves.push({ mv, pts });
+    }
+    // конфликтные точки: пересечения траекторий с разных въездов в разные выезды
+    const conflicts = [];
+    const segX = (p1, p2, p3, p4) => {
+      const d = (p2.x - p1.x) * (p4.y - p3.y) - (p2.y - p1.y) * (p4.x - p3.x);
+      if (Math.abs(d) < 1e-9) return null;
+      const t = ((p3.x - p1.x) * (p4.y - p3.y) - (p3.y - p1.y) * (p4.x - p3.x)) / d;
+      const u = ((p3.x - p1.x) * (p2.y - p1.y) - (p3.y - p1.y) * (p2.x - p1.x)) / d;
+      return t > 0 && t < 1 && u > 0 && u < 1 ? { x: p1.x + (p2.x - p1.x) * t, y: p1.y + (p2.y - p1.y) * t } : null;
+    };
+    for (let i = 0; i < curves.length; i++) for (let j = i + 1; j < curves.length; j++) {
+      const A = curves[i], B = curves[j];
+      if (angleDiff(A.mv.from.bearing, B.mv.from.bearing) < 20 || angleDiff(A.mv.to.bearing, B.mv.to.bearing) < 20) continue;
+      let hit = null;
+      for (let s = 1; s < A.pts.length && !hit; s++) for (let t = 1; t < B.pts.length && !hit; t++) hit = segX(A.pts[s - 1], A.pts[s], B.pts[t - 1], B.pts[t]);
+      if (hit) conflicts.push({ at: hit, a: A.mv, b: B.mv, left: A.mv.type === "left" || B.mv.type === "left" });
+    }
+    return { curves, conflicts };
+  }
+
+  function drawTrajectories() {
+    g.traj.clearLayers();
+    if (!state.doc || !state.showTraj || map.getZoom() < 17) return;
+    const doc = state.doc, view = map.getBounds();
+    const c = map.getCenter(), M = meters(c.lat), O = { lat: c.lat, lon: c.lng };
+    for (const [id, ways] of doc.nodeWays) {
+      const n = doc.nodes.get(id);
+      if (!view.contains([n.lat, n.lon])) continue;
+      if ([...ways].filter((w) => isDrivable(doc.ways.get(w))).length < 2) continue;
+      if (doc.approaches(id).filter((a) => a.incoming).length < 2) continue;
+      const { curves, conflicts } = junctionTrajectories(id, M, O);
+      for (const cv of curves) {
+        L.polyline(cv.pts.map((p) => M.back(p, O)), { renderer, color: TRAJ_COLORS[cv.mv.type], weight: 2.5, opacity: 0.85, interactive: false }).addTo(g.traj);
+        const end = cv.pts[cv.pts.length - 1], pre = cv.pts[cv.pts.length - 3];
+        const ang = Math.atan2(end.x - pre.x, end.y - pre.y);
+        const head = (da) => ({ x: end.x - Math.sin(ang + da) * 2.2, y: end.y - Math.cos(ang + da) * 2.2 });
+        L.polyline([head(0.5), end, head(-0.5)].map((p) => M.back(p, O)), { renderer, color: TRAJ_COLORS[cv.mv.type], weight: 2.5, interactive: false }).addTo(g.traj);
+      }
+      for (const cf of conflicts) {
+        L.circleMarker(M.back(cf.at, O), { renderer, radius: cf.left ? 5 : 4, color: "#fff", weight: 1.5, fillColor: cf.left ? "#e03131" : "#f59f00", fillOpacity: 1 })
+          .bindTooltip(`Конфликт: ${TRAJ_NAMES[cf.a.type]} с «${cf.a.from.name}» × ${TRAJ_NAMES[cf.b.type]} с «${cf.b.from.name}»`).addTo(g.traj);
+      }
+    }
+  }
+
+  function toggleTraj() {
+    state.showTraj = !state.showTraj;
+    $("#btn-traj").classList.toggle("active-toggle", state.showTraj);
+    if (state.showTraj && map.getZoom() < 17) map.setZoom(17);
+    drawTrajectories();
+    toast(state.showTraj ? "Траектории манёвров: оранжевые — налево, синие — направо, серые — прямо; красные точки — конфликты с левым поворотом" : "Траектории скрыты");
+  }
+  $("#btn-traj").addEventListener("click", toggleTraj);
+
+  /** Сводка манёвров для панели узла. */
+  function maneuversBlock(n) {
+    const doc = state.doc;
+    if (doc.approaches(n.id).filter((a) => a.incoming).length < 2) return null;
+    const c = map.getCenter(), M = meters(c.lat), O = { lat: c.lat, lon: c.lng };
+    const { curves, conflicts } = junctionTrajectories(n.id, M, O);
+    const byType = {};
+    for (const cv of curves) byType[cv.mv.type] = (byType[cv.mv.type] || 0) + 1;
+    const leftC = conflicts.filter((x) => x.left).length;
+    const forbidden = doc.movements(n.id).filter((m) => !m.allowed && m.type !== "reverse").length;
+    return el("div", {},
+      el("h3", {}, "Манёвры и конфликты"),
+      el("div", { class: "stats" },
+        "Разрешённых манёвров", el("b", {}, curves.length),
+        "  налево / прямо / направо", el("b", {}, `${byType.left || 0} / ${byType.through || 0} / ${byType.right || 0}`),
+        "Запрещено стрелками", el("b", {}, forbidden),
+        "Конфликтных точек", el("b", {}, conflicts.length),
+        "  из них с левым поворотом", el("b", {}, leftC)),
+      el("p", { class: "muted small" }, "Конфликт — пересечение траекторий с разных подъездов. Больше всего риска у левых поворотов через встречный поток: их можно убрать стрелками на полосах или отдельной фазой светофора."),
+      el("div", { class: "actions" }, el("button", { onclick: () => { if (!state.showTraj) toggleTraj(); map.setView(ll(n), Math.max(map.getZoom(), 18)); } }, "Показать траектории")));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Редактор стрелок на полосах
+  // ---------------------------------------------------------------------------
+
+  const TURN_OPTIONS = [
+    ["", "—"], ["through", "↑ прямо"], ["left", "← налево"], ["right", "→ направо"],
+    ["left;through", "←↑"], ["through;right", "↑→"], ["left;through;right", "←↑→"], ["left;right", "←→"],
+    ["reverse", "↶ разворот"], ["reverse;left", "↶←"],
+  ];
+
+  function turnLanesEditor(w) {
+    const doc = state.doc;
+    const wrap = el("div", { class: "turns" });
+    const sides = onewayDir(w) !== 0 ? [["forward", "Стрелки по полосам (слева направо по ходу)"]]
+      : [["forward", "Туда → (слева направо по ходу)"], ["backward", "← Обратно (слева направо по ходу)"]];
+    for (const [side, title] of sides) {
+      const lanes = doc.turnLanes(w, side);
+      if (!lanes.length) continue;
+      const row = el("div", { class: "turn-row" });
+      lanes.forEach((v, i) => {
+        const s = el("select", { title: `Полоса ${i + 1}` });
+        for (const [val, text] of TURN_OPTIONS) {
+          const o = el("option", { value: val }, text);
+          if (val === v) o.selected = true;
+          s.append(o);
+        }
+        if (v && !TURN_OPTIONS.some(([val]) => val === v)) s.prepend(el("option", { value: v, selected: true }, v));
+        s.addEventListener("change", () => run("стрелки на полосах", () => {
+          const cur = doc.turnLanes(doc.ways.get(w.id), side);
+          cur[i] = s.value;
+          doc.setTurnLanes(w.id, side, cur);
+        }));
+        row.append(s);
+      });
+      wrap.append(el("p", { class: "small muted", style: "margin:6px 0 2px" }, title), row);
+    }
+    if (!wrap.childElementCount) return null;
+    wrap.append(el("div", { class: "actions" }, el("button", { onclick: () => run("стрелки по умолчанию", () => {
+      for (const [side] of sides) {
+        const ww = doc.ways.get(w.id);
+        const def = doc.defaultTurnLanes(ww, side);
+        if (def.some(Boolean)) doc.setTurnLanes(w.id, side, def);
+      }
+    }) }, "Стрелки по умолчанию")));
+    wrap.append(el("p", { class: "muted small" }, "Если стрелки не заданы, на карте показаны предполагаемые — жёлтым пунктиром: крайняя левая — налево, крайняя правая — прямо и направо, с учётом запретов манёвров. Сервер проверки стрелки не учитывает: SUMO на нём запускается без их импорта."));
+    return wrap;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Общественный транспорт: маршруты и остановки из файла, доступность, рельеф
+  // ---------------------------------------------------------------------------
+
+  const MODE_NAMES = { bus: "Автобус", trolleybus: "Троллейбус", tram: "Трамвай", minibus: "Маршрутка", share_taxi: "Маршрутка" };
+  const MODE_COLORS = { bus: "#1971c2", trolleybus: "#2f9e44", tram: "#e8590c", minibus: "#9c36b5", share_taxi: "#9c36b5" };
+  const transit = { shown: new Set(), access: null, minutes: 5, useRelief: false, heights: null };
+
+  function drawTransit() {
+    g.transit.clearLayers();
+    const doc = state.doc;
+    if (!doc) return;
+    const routes = doc.transitRoutes().filter((r) => transit.shown.has(r.id));
+    routes.forEach((r, i) => {
+      const color = r.colour || MODE_COLORS[r.mode] || "#1971c2";
+      for (const wid of r.ways) {
+        const w = doc.ways.get(wid);
+        if (!w) continue;
+        L.polyline(w.nodes.map((n) => ll(doc.nodes.get(n))), { renderer, color, weight: 5, opacity: 0.75, interactive: true })
+          .bindTooltip(`${MODE_NAMES[r.mode] || r.mode} ${r.ref}: ${r.name}`, { sticky: true }).addTo(g.transit);
+      }
+    });
+    for (const st of doc.transitStops()) {
+      L.circleMarker([st.lat, st.lon], { renderer: pointRenderer, pane: "pointsPane", radius: st.user ? 7 : 5.5, color: "#fff", weight: 2, fillColor: st.user ? "#e8590c" : "#1971c2", fillOpacity: 1 })
+        .bindTooltip(st.name + (st.user ? " (новая)" : "")).on("click", (e) => { L.DomEvent.stop(e); select({ type: "node", id: st.id, way: null }); })
+        .addTo(g.transit);
+    }
+  }
+
+  function drawAccess() {
+    g.access.clearLayers();
+    const a = transit.access;
+    if (!a || !state.doc) return;
+    const doc = state.doc;
+    // зона — пешеходные пути, по которым до остановки дойти за заданное время; толщина ~ 50 м по сторонам
+    const mpp = (40075016.686 * Math.cos((map.getCenter().lat * Math.PI) / 180)) / Math.pow(2, map.getZoom() + 8);
+    const weight = Math.max(6, Math.min(80, 100 / mpp));
+    for (const [u, v, f] of [...a.edges].sort((x, y) => x[2] - y[2])) {
+      const A = doc.nodes.get(u), B = doc.nodes.get(v);
+      if (!A || !B) continue;
+      L.polyline([ll(A), ll(B)], { renderer: accessRenderer, pane: "accessPane", color: f > 0.5 ? "#2f9e44" : "#8ce99a", weight, opacity: 1, lineCap: "round", interactive: false }).addTo(g.access);
+    }
+  }
+  map.on("zoomend", () => { if (transit.access) drawAccess(); });
+
+  function recomputeAccess(quiet) {
+    if (!state.doc) return;
+    const stops = state.doc.transitStops();
+    transit.access = window.Pedestrians.accessibility(state.doc, stops, {
+      minutes: transit.minutes, heightOf: transit.useRelief && transit.heights ? transit.heights : null,
+    });
+    if (!map.hasLayer(g.access)) map.addLayer(g.access);
+    drawAccess();
+    if (!quiet) toast(`Доступность пересчитана: ${transit.access.covered} из ${transit.access.buildings} зданий в ${transit.minutes} мин от остановки`);
+    if (activeTab() === "ot") renderOt();
+  }
+
+  // ----- рельеф: высоты из открытых тайлов Terrarium (AWS), горизонтали -----
+  async function loadRelief() {
+    const doc = state.doc;
+    if (!doc) return;
+    const b = doc._bbox([...doc.ways.values()].filter(isDrivable));
+    const z = 15, n2 = Math.pow(2, z);
+    const tx = (lon) => ((lon + 180) / 360) * n2;
+    const ty = (lat) => ((1 - Math.log(Math.tan((lat * Math.PI) / 180) + 1 / Math.cos((lat * Math.PI) / 180)) / Math.PI) / 2) * n2;
+    const x0 = Math.floor(tx(b.minLon)), x1 = Math.floor(tx(b.maxLon)), y0 = Math.floor(ty(b.maxLat)), y1 = Math.floor(ty(b.minLat));
+    const W = (x1 - x0 + 1) * 256, H = (y1 - y0 + 1) * 256;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    toast("Загрузка данных рельефа…");
+    const load = (x, y) => new Promise((res, rej) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => { ctx.drawImage(img, (x - x0) * 256, (y - y0) * 256); res(); };
+      img.onerror = () => rej(new Error("тайл рельефа не загрузился"));
+      img.src = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
+    });
+    const jobs = [];
+    for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) jobs.push(load(x, y));
+    await Promise.all(jobs);
+    const data = ctx.getImageData(0, 0, W, H).data;
+    const hAt = (px, py) => {
+      px = Math.max(0, Math.min(W - 1, px)); py = Math.max(0, Math.min(H - 1, py));
+      const i = (Math.floor(py) * W + Math.floor(px)) * 4;
+      return data[i] * 256 + data[i + 1] + data[i + 2] / 256 - 32768;
+    };
+    const pix = (lat, lon) => [(tx(lon) - x0) * 256, (ty(lat) - y0) * 256];
+    const cache = new Map();
+    transit.heights = (id) => {
+      if (cache.has(id)) return cache.get(id);
+      const n = doc.nodes.get(id);
+      if (!n) return null;
+      const [px, py] = pix(n.lat, n.lon);
+      const v = hAt(px, py);
+      cache.set(id, v);
+      return v;
+    };
+    // горизонтали «бегущими квадратами» по сетке с шагом 4 пикселя (~19 м)
+    g.relief.clearLayers();
+    const step = 4, gw = Math.floor(W / step), gh = Math.floor(H / step);
+    const grid = new Float32Array(gw * gh);
+    let lo = Infinity, hi = -Infinity;
+    for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+      const v = hAt(i * step, j * step);
+      grid[j * gw + i] = v; lo = Math.min(lo, v); hi = Math.max(hi, v);
+    }
+    const toLL = (px, py) => {
+      const X = px / 256 + x0, Y = py / 256 + y0;
+      const lon = (X / n2) * 360 - 180;
+      const lat = (Math.atan(Math.sinh(Math.PI * (1 - (2 * Y) / n2))) * 180) / Math.PI;
+      return [lat, lon];
+    };
+    const interval = hi - lo > 60 ? 5 : 2;
+    for (let level = Math.ceil(lo / interval) * interval; level <= hi; level += interval) {
+      const major = level % (interval * 5) === 0;
+      for (let j = 0; j < gh - 1; j++) for (let i = 0; i < gw - 1; i++) {
+        const a = grid[j * gw + i], bb = grid[j * gw + i + 1], c = grid[(j + 1) * gw + i + 1], d = grid[(j + 1) * gw + i];
+        const pts = [];
+        const edge = (v1, v2, p1, p2) => { if ((v1 < level) !== (v2 < level)) { const t = (level - v1) / (v2 - v1); pts.push([p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t]); } };
+        const P = (ii, jj) => [ii * step, jj * step];
+        edge(a, bb, P(i, j), P(i + 1, j)); edge(bb, c, P(i + 1, j), P(i + 1, j + 1));
+        edge(c, d, P(i + 1, j + 1), P(i, j + 1)); edge(d, a, P(i, j + 1), P(i, j));
+        for (let k = 0; k + 1 < pts.length; k += 2) {
+          L.polyline([toLL(...pts[k]), toLL(...pts[k + 1])], { renderer, color: "#a0522d", weight: major ? 1.6 : 0.8, opacity: major ? 0.8 : 0.5, interactive: false }).addTo(g.relief);
+        }
+      }
+    }
+    transit.relief = { lo: Math.round(lo), hi: Math.round(hi), interval };
+    if (!map.hasLayer(g.relief)) map.addLayer(g.relief);
+    toast(`Рельеф: высоты ${Math.round(lo)}–${Math.round(hi)} м, горизонтали через ${interval} м`);
+  }
+
+  function renderOt() {
+    const box = $("#tab-ot");
+    box.replaceChildren();
+    const doc = state.doc;
+    if (!doc) { box.append(el("p", { class: "muted" }, "Файл не открыт.")); return; }
+    const routes = doc.transitRoutes();
+    const stops = doc.transitStops();
+    box.append(el("h2", {}, "Общественный транспорт"),
+      el("p", { class: "muted small" }, `Из файла: маршрутов ${routes.length}, остановок ${stops.length}. Маршруты — отношения OSM route=bus/trolleybus/tram, в файл они не добавляются и не меняются.`));
+
+    // доступность
+    const minutes = el("select", {}, ...[3, 5, 7, 10].map((m) => { const o = el("option", { value: m }, `${m} мин (≈${Math.round(m * 75)} м)`); if (m === transit.minutes) o.selected = true; return o; }));
+    minutes.addEventListener("change", () => { transit.minutes = +minutes.value; if (transit.access) recomputeAccess(); });
+    const relief = el("input", { type: "checkbox" });
+    relief.checked = transit.useRelief;
+    relief.addEventListener("change", async () => {
+      transit.useRelief = relief.checked;
+      if (relief.checked && !transit.heights) {
+        try { await loadRelief(); } catch (e) { toast("Нет доступа к данным рельефа: " + e.message); transit.useRelief = false; relief.checked = false; }
+      }
+      if (transit.access) recomputeAccess();
+    });
+    box.append(el("h3", {}, "Пешеходная доступность остановок"),
+      el("p", { class: "muted small" }, "Зона, из которой до ближайшей остановки можно дойти пешком за заданное время по тротуарам и переходам (4,5 км/ч). С рельефом — по функции Тоблера: в гору медленнее."),
+      el("div", { class: "form" }, ...field("Время пешком", minutes)),
+      el("div", { class: "checks" }, el("label", {}, relief, "Учитывать рельеф")),
+      el("div", { class: "actions" },
+        el("button", { class: "primary", onclick: () => recomputeAccess() }, transit.access ? "Пересчитать" : "Показать зону"),
+        el("button", { onclick: () => setMode("stop"), title: "Клик по карте — новая остановка, зона пересчитается сама (O)" }, "+ Остановка"),
+        ...(transit.access ? [el("button", { onclick: () => { transit.access = null; g.access.clearLayers(); renderOt(); } }, "Убрать")] : [])));
+    if (transit.access) {
+      const a = transit.access;
+      const pct = a.buildings ? Math.round((a.covered / a.buildings) * 100) : 0;
+      box.append(el("div", { class: "stats" },
+        "Зданий в зоне доступности", el("b", {}, `${a.covered} из ${a.buildings} (${pct} %)`),
+        "Остановок учтено", el("b", {}, a.perStop.filter((p) => p.reached).length)),
+        el("p", { class: "muted small" }, "Зелёное — близко к остановке, светло-зелёное — на границе зоны. Новые остановки (оранжевые) можно удалить как обычный узел."));
+    }
+
+    // рельеф
+    box.append(el("h3", {}, "Рельеф"),
+      el("div", { class: "actions" }, el("button", { onclick: async () => {
+        try { await loadRelief(); renderOt(); } catch (e) { toast("Нет доступа к данным рельефа: " + e.message); }
+      } }, transit.relief ? "Обновить горизонтали" : "Показать горизонтали")),
+      ...(transit.relief ? [el("p", { class: "small" }, `Высоты ${transit.relief.lo}–${transit.relief.hi} м, горизонтали через ${transit.relief.interval} м (толстые — каждые ${transit.relief.interval * 5} м).`)] : []),
+      el("p", { class: "muted small" }, "Высоты — открытая цифровая модель рельефа Terrarium (Mapzen/AWS), нужен интернет. В .osm не записываются."));
+
+    // маршруты
+    box.append(el("h3", {}, "Маршруты"),
+      el("div", { class: "actions" },
+        el("button", { onclick: () => { routes.forEach((r) => transit.shown.add(r.id)); if (!map.hasLayer(g.transit)) map.addLayer(g.transit); drawTransit(); renderOt(); } }, "Показать все"),
+        el("button", { onclick: () => { transit.shown.clear(); drawTransit(); renderOt(); } }, "Скрыть все")));
+    let lastMode = null;
+    for (const r of routes) {
+      if (r.mode !== lastMode) { box.append(el("p", { class: "small", style: "margin:10px 0 4px;font-weight:600;color:" + MODE_COLORS[r.mode] }, MODE_NAMES[r.mode] || r.mode)); lastMode = r.mode; }
+      const cb = el("input", { type: "checkbox" });
+      cb.checked = transit.shown.has(r.id);
+      cb.addEventListener("change", () => {
+        if (cb.checked) transit.shown.add(r.id); else transit.shown.delete(r.id);
+        if (!map.hasLayer(g.transit)) map.addLayer(g.transit);
+        drawTransit();
+      });
+      box.append(el("label", { class: "route-row" }, cb, el("b", { style: "color:" + (r.colour || MODE_COLORS[r.mode]) }, r.ref || "—"), el("span", { class: "small" }, r.name.replace(/^(Автобус|Троллейбус|Трамвай)\s*\S*:\s*/, ""))));
+    }
+  }
+
+  function onStopClick(latlng) {
+    const doc = state.doc;
+    // ставим у ближайшей дороги или тротуара, но отдельной точкой — как платформа в OSM
+    const id = run("новая остановка", () => doc.addStop(latlng.lat, latlng.lng, "Новая остановка"));
+    if (!id) return;
+    drawTransit();
+    if (!map.hasLayer(g.transit)) map.addLayer(g.transit);
+    select({ type: "node", id, way: null });
+    if (transit.access) recomputeAccess(true);
+    toast("Остановка поставлена" + (transit.access ? " — зона доступности пересчитана" : ". Вкладка «ОТ» → «Показать зону» покажет доступность"));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Неполные данные: что не заполнено и заполнение по нормам
+  // ---------------------------------------------------------------------------
+
+  const FIELD_NAMES = { lanes: "число полос", maxspeed: "скорость", width: "ширина", surface: "покрытие", name: "название" };
+  function missingBlock() {
+    const doc = state.doc;
+    const { fields, total } = doc.missingData();
+    const box = el("div", { class: "missing" });
+    const rows = Object.entries(fields).filter(([, ids]) => ids.length);
+    if (!rows.length) { box.append(el("p", { class: "small" }, "Все поля у дорог для машин заполнены.")); return box; }
+    for (const [f, ids] of rows) {
+      box.append(el("div", { class: "missing-row" },
+        el("span", {}, `${FIELD_NAMES[f]}: не указано у ${ids.length} из ${total}`),
+        el("button", { onclick: () => {
+          g.diff.clearLayers();
+          for (const id of ids) { const l = wayLayers.get(id); if (l) L.polyline(l.getLatLngs(), { renderer, color: "#f2b705", weight: 9, opacity: 0.55, interactive: false }).addTo(g.diff); }
+          toast(`Подсвечены дороги без поля «${FIELD_NAMES[f]}»`);
+        } }, "Показать")));
+    }
+    box.append(el("div", { class: "actions" }, el("button", { class: "primary", onclick: () => {
+      const plan = doc.autofillPlan(AUTOFILL_DEFAULTS, ["lanes", "maxspeed", "width", "surface", "turns"]);
+      if (!plan.length) return toast("Нечего заполнять по нормам");
+      const by = {};
+      for (const p of plan) by[p.key] = (by[p.key] || 0) + 1;
+      if (!confirm(`Заполнить по нормам только пустые поля?\nполосы — ${by.lanes || 0}, скорость — ${by.maxspeed || 0}, ширина — ${by.width || 0}, покрытие — ${by.surface || 0}, стрелки — ${by.turns || 0}.\nОтменить можно Ctrl+Z.`)) return;
+      run("заполнить по нормам", () => doc.applyAutofill(plan));
+      g.diff.clearLayers();
+      toast("Заполнено по нормам. Проверьте ключевые улицы по реальности.");
+    } }, "Заполнить по нормам")),
+      el("p", { class: "muted small" }, "Нормы: ширина полосы по СП 42.13330 (магистральные 3,5 м, местные 3,0 м, проезды 3,0 м), скорость по ПДД (город 60, жилая зона и дворы 20 км/ч), покрытие — асфальт, стрелки — по разрешённым манёврам. Заполняются только пустые поля."));
+    return box;
+  }
+
+  function notifyMissing() {
+    const { fields, total } = state.doc.missingData();
+    const worst = Object.entries(fields).sort((a, b) => b[1].length - a[1].length)[0];
+    if (worst && worst[1].length) {
+      setTimeout(() => toast(`Не хватает данных: ${FIELD_NAMES[worst[0]]} не указано у ${worst[1].length} из ${total} дорог. Обзор → «Не хватает данных»`), 3800);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Симуляция перекрёстка (без визуализации)
+  // ---------------------------------------------------------------------------
+
+  function simBlock(n, prog) {
+    const wrap = el("div", {});
+    const out = el("div", {});
+    wrap.append(el("div", { class: "actions" }, el("button", { onclick: () => {
+      const t0 = performance.now();
+      const sim = state.doc.simulateJunction(n.id, state.doc.tlsProgram(n.id), { duration: 3600, runs: 5 });
+      const ms = Math.round(performance.now() - t0);
+      const tbl = el("table", { class: "calc" },
+        el("tr", {}, ...["Подъезд", "пришло", "проехало", "осталось", "задержка, с", "остановок", "очередь ср/макс", "сбой циклов"].map((h) => el("th", {}, h))));
+      for (const r of sim.rows) {
+        tbl.append(el("tr", { class: r.leftInQueue > 10 ? "over" : r.failedCycles > 0.2 ? "warn" : "" },
+          el("td", {}, compass(r.bearing)), el("td", {}, r.arrived), el("td", {}, r.departed), el("td", {}, r.leftInQueue),
+          el("td", {}, r.avgDelay != null ? r.avgDelay.toFixed(0) : "—"), el("td", {}, r.stopShare != null ? Math.round(r.stopShare * 100) + " %" : "—"),
+          el("td", {}, `${r.avgQueue.toFixed(1)} / ${r.maxQueue} авт · ${r.maxQueueM} м`), el("td", {}, Math.round(r.failedCycles * 100) + " %")));
+      }
+      out.replaceChildren(el("div", { class: "scroll" }, tbl),
+        el("div", { class: "stats", style: "margin-top:6px" },
+          "Пришло / проехало за час", el("b", {}, `${sim.totalArrived} / ${sim.totalDeparted}`),
+          "Средняя задержка", el("b", {}, sim.avgDelay != null ? `${sim.avgDelay.toFixed(0)} с · уровень ${sim.los}` : "—"),
+          "Прогонов / расчёт", el("b", {}, `${sim.runs} × 1 ч · ${ms} мс`)),
+        el("p", { class: "muted small" }, "Имитация по секундам: машины приходят случайно с заданной интенсивностью, на зелёном уезжают по одной в 2 с с каждой полосы после 2 с на старт, на жёлтом — первые 2 с. «Сбой цикла» — зелёный кончился, а очередь не разъехалась. Среднее по 5 прогонам. Меняйте фазы — и запускайте снова."));
+    } }, "Симуляция: 1 час")), out);
+    return wrap;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Светофорный объект: фазы, длительности, сдвиг, диаграмма цикла
+  // ---------------------------------------------------------------------------
+
+  const { bearing: _b, angleDiff } = window.OSM;
+  const COMPASS = ["С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ"];
+  const compass = (deg) => COMPASS[Math.round(deg / 45) % 8];
+  let tlsPhaseSel = 0;
+
+  function cycleOf(prog) {
+    return prog.phases.reduce((s, p) => s + (+p.dur || 0) + (+p.yellow || 0) + (+p.red || 0), 0);
+  }
+
+  function tlsEditor(n) {
+    const doc = state.doc;
+    const appr = doc.approaches(n.id);
+    const incoming = appr.filter((a) => a.incoming);
+    const box = el("div", { class: "tls" });
+    if (incoming.length < 2 && !n.tags["uds:tls"]) return null;
+    const prog = doc.tlsProgram(n.id);
+    const isSignal = n.tags.highway === "traffic_signals";
+    box.append(el("h3", {}, "Светофор и фазы"));
+
+    if (!prog) {
+      box.append(
+        el("p", { class: "small" }, isSignal
+          ? "Светофор есть, программа — по умолчанию: SUMO построит цикл сам (обычно 90 с, фазы по направлениям)."
+          : `Нерегулируемый перекрёсток, подъездов: ${incoming.length}.`),
+        el("div", { class: "actions" },
+          el("button", { class: "primary", onclick: () => {
+            tlsPhaseSel = 0;
+            run(isSignal ? "настроить фазы" : "регулируемый перекрёсток", () => doc.setTlsProgram(n.id, doc.defaultTlsProgram(n.id)));
+          } }, isSignal ? "Настроить фазы" : "Сделать регулируемым")));
+      return box;
+    }
+
+    const save = (label, mutate) => run(label, () => {
+      const p = JSON.parse(JSON.stringify(doc.tlsProgram(n.id)));
+      mutate(p);
+      p.approaches = appr.map((a) => ({ bearing: a.bearing, name: a.name, incoming: a.incoming }));
+      doc.setTlsProgram(n.id, p);
+    });
+    const inPhase = (ph, a) => ph.green.some((g) => angleDiff(g, a.bearing) <= 25);
+    if (tlsPhaseSel >= prog.phases.length) tlsPhaseSel = 0;
+
+    // схема перекрёстка: подъезды и зелёные стрелки выбранной фазы
+    const cur = prog.phases[tlsPhaseSel];
+    const R = 70, C = 90;
+    const svg = [`<svg viewBox="0 0 180 180" class="tls-diagram" role="img" aria-label="Схема перекрёстка">`,
+      `<circle cx="${C}" cy="${C}" r="16" fill="var(--hover)" stroke="var(--line)"/>`];
+    for (const a of appr) {
+      const rad = (a.bearing * Math.PI) / 180;
+      const x = C + Math.sin(rad) * R, y = C - Math.cos(rad) * R;
+      const x0 = C + Math.sin(rad) * 18, y0 = C - Math.cos(rad) * 18;
+      const green = a.incoming && cur && inPhase(cur, a);
+      const color = !a.incoming ? "#adb5bd" : green ? "#2f9e44" : "#e03131";
+      svg.push(`<line x1="${x}" y1="${y}" x2="${x0}" y2="${y0}" stroke="${color}" stroke-width="${a.incoming ? 7 : 4}" stroke-linecap="round"${a.incoming ? "" : ' stroke-dasharray="3 4"'}/>`);
+      if (a.incoming) {
+        const ax = C + Math.sin(rad) * 28, ay = C - Math.cos(rad) * 28;
+        const ang = a.bearing + 180;
+        svg.push(`<path d="M0,-7 L6,5 L-6,5 Z" fill="${color}" transform="translate(${ax},${ay}) rotate(${ang})"/>`);
+      }
+      const lx = C + Math.sin(rad) * (R + 4), ly = C - Math.cos(rad) * (R + 4);
+      svg.push(`<text x="${lx}" y="${ly}" font-size="9" text-anchor="middle" dominant-baseline="middle" fill="var(--text)">${compass(a.bearing)}</text>`);
+    }
+    svg.push("</svg>");
+    const diagram = el("div", { class: "tls-top" });
+    diagram.innerHTML = svg.join("");
+    diagram.append(el("div", { class: "small" },
+      el("p", { style: "margin:0 0 4px" }, el("b", {}, `Цикл ${cycleOf(prog)} с`), ` · фаз ${prog.phases.length}`),
+      el("p", { class: "muted", style: "margin:0" }, "Стрелки — подъезды; зелёные получают зелёный в выбранной фазе, пунктир — только выезд.")));
+    box.append(diagram);
+
+    // фазы
+    for (const [k, ph] of prog.phases.entries()) {
+      const num = (key, val, title, min) => {
+        const i = el("input", { type: "number", min: min, max: 180, value: val, title });
+        i.addEventListener("change", () => save(`фаза ${k + 1}: ${title}`, (p) => { p.phases[k][key] = Math.max(min, parseInt(i.value, 10) || 0); }));
+        return i;
+      };
+      const name = el("input", { type: "text", value: ph.name || "", placeholder: `Фаза ${k + 1}` });
+      name.addEventListener("change", () => save("название фазы", (p) => { p.phases[k].name = name.value.trim(); }));
+      const chips = el("div", { class: "chips" }, ...incoming.map((a) => {
+        const on = inPhase(ph, a);
+        return el("button", { class: "chip" + (on ? " on" : ""), title: on ? "Убрать из фазы" : "Дать зелёный в этой фазе",
+          onclick: () => save(on ? "убрать подъезд из фазы" : "добавить подъезд в фазу", (p) => {
+            const g = p.phases[k].green.filter((b) => angleDiff(b, a.bearing) > 25);
+            if (!on) g.push(a.bearing);
+            p.phases[k].green = g;
+          }) }, `${compass(a.bearing)} · ${a.name}`);
+      }));
+      box.append(el("div", { class: "phase" + (k === tlsPhaseSel ? " sel" : ""), onclick: (e) => {
+        if (e.target.closest("input, button")) return;
+        tlsPhaseSel = k; renderPanel();
+      } },
+        el("div", { class: "phase-head" }, el("b", {}, `${k + 1}`), name,
+          el("button", { title: "Выше", disabled: k === 0, onclick: () => save("порядок фаз", (p) => { [p.phases[k - 1], p.phases[k]] = [p.phases[k], p.phases[k - 1]]; tlsPhaseSel = k - 1; }) }, "↑"),
+          el("button", { title: "Ниже", disabled: k === prog.phases.length - 1, onclick: () => save("порядок фаз", (p) => { [p.phases[k + 1], p.phases[k]] = [p.phases[k], p.phases[k + 1]]; tlsPhaseSel = k + 1; }) }, "↓"),
+          el("button", { title: "Удалить фазу", class: "danger", disabled: prog.phases.length === 1, onclick: () => save("удалить фазу", (p) => { p.phases.splice(k, 1); tlsPhaseSel = 0; }) }, "✕")),
+        chips,
+        el("div", { class: "phase-times" },
+          el("label", {}, "Зелёный", num("dur", ph.dur, "зелёный, с", 1)),
+          el("label", {}, "Жёлтый", num("yellow", ph.yellow ?? 3, "жёлтый, с", 0)),
+          el("label", {}, "Все красные", num("red", ph.red ?? 0, "все красные, с", 0)))));
+    }
+
+    // диаграмма цикла (как фазовая диаграмма в AnyLogic): строка на каждый подъезд
+    box.append(el("h3", {}, "Диаграмма цикла"), cycleChart(prog, incoming));
+
+    // интенсивности и расчёт пропускной способности
+    box.append(el("h3", {}, "Расчёт: пропускная способность и очереди"));
+    const flowGrid = el("div", { class: "flow-grid" });
+    for (const ap of incoming) {
+      const k = Object.keys(prog.flows || {}).find((b) => angleDiff(+b, ap.bearing) <= 25);
+      const inp = el("input", { type: "number", min: 0, max: 5000, step: 50, value: k ? prog.flows[k] : "", placeholder: "авт/ч" });
+      inp.addEventListener("change", () => save("интенсивность подъезда", (p) => {
+        p.flows = p.flows || {};
+        for (const b of Object.keys(p.flows)) if (angleDiff(+b, ap.bearing) <= 25) delete p.flows[b];
+        const v = parseInt(inp.value, 10);
+        if (v > 0) p.flows[ap.bearing] = v;
+      }));
+      flowGrid.append(el("label", {}, `${compass(ap.bearing)} · ${ap.name}`), inp);
+    }
+    box.append(el("p", { class: "muted small", style: "margin:0 0 4px" }, "Интенсивность в час пик, авт/ч — по натурным наблюдениям или данным транспортников."), flowGrid);
+    const cap = doc.tlsCapacity(n.id, prog);
+    if (cap && cap.rows.some((r) => r.flow > 0)) {
+      const fmt = (v, d) => (v == null || !Number.isFinite(v) ? "—" : v.toFixed(d));
+      const tbl = el("table", { class: "calc" },
+        el("tr", {}, ...["Подъезд", "авт/ч", "полос", "пропуск, авт/ч", "загрузка", "задержка, с", "очередь", "уровень"].map((h) => el("th", {}, h))));
+      for (const r of cap.rows) {
+        tbl.append(el("tr", { class: r.x >= 1 ? "over" : r.x > 0.85 ? "warn" : "" },
+          el("td", {}, compass(r.bearing)), el("td", {}, r.flow || "—"), el("td", {}, r.lanes), el("td", {}, r.capacity),
+          el("td", {}, r.flow ? fmt(r.x, 2) : "—"), el("td", {}, r.x >= 1 ? "перегруз" : fmt(r.delay, 0)),
+          el("td", {}, r.queue ? `${r.queue.veh} авт · ${r.queue.m} м` : r.x >= 1 ? "растёт" : "—"), el("td", {}, r.los || "—")));
+      }
+      box.append(el("div", { class: "scroll" }, tbl),
+        el("div", { class: "stats", style: "margin-top:6px" },
+          "Цикл сейчас", el("b", {}, `${cap.cycle} с`),
+          "Оптимальный по Вебстеру", el("b", {}, cap.C0 ? `${cap.C0} с` : cap.Y >= 0.95 ? "перегруз (Y ≥ 0,95)" : "—"),
+          "Сумма критических отношений Y", el("b", {}, cap.Y.toFixed(2)),
+          "Средняя задержка", el("b", {}, cap.avgDelay != null ? `${cap.avgDelay.toFixed(0)} с · уровень ${cap.los}` : "—")),
+        el("div", { class: "actions" },
+          el("button", { class: "primary", disabled: !cap.C0, title: "Цикл по формуле Вебстера, зелёный — пропорционально нагрузке фаз", onclick: () => {
+            const w = doc.websterProgram(n.id, doc.tlsProgram(n.id));
+            if (w) run("фазы по Вебстеру", () => doc.setTlsProgram(n.id, w));
+          } }, "Подобрать фазы по Вебстеру")),
+        el("h3", {}, "Симуляция без визуализации"),
+        simBlock(n, prog),
+        el("p", { class: "muted small" }, "Поток насыщения — 1800 авт/ч на полосу; при подборе цикл 40–150 с, зелёный не меньше 10 с. Задержка — формула Вебстера, очередь — к началу зелёного (7 м на машину), уровень обслуживания — по задержке, как в HCM: A ≤ 10 с … F > 80 с или загрузка ≥ 1. Это расчёт; проверить в микромодели — tools/sumo_check.py."));
+    }
+
+    const offset = el("input", { type: "number", min: 0, max: 300, value: prog.offset || 0, title: "Сдвиг начала цикла — для «зелёной волны» с соседними светофорами" });
+    offset.addEventListener("change", () => save("сдвиг цикла", (p) => { p.offset = Math.max(0, parseInt(offset.value, 10) || 0); }));
+    box.append(
+      el("div", { class: "form", style: "margin-top:8px" }, ...field("Сдвиг, с", offset)),
+      el("div", { class: "actions" },
+        el("button", { onclick: () => save("добавить фазу", (p) => { p.phases.push({ name: "", green: [], dur: 20, yellow: 3, red: 2 }); tlsPhaseSel = p.phases.length - 1; }) }, "+ Фаза"),
+        el("button", { title: "Встречные подъезды вместе, две фазы", onclick: () => { tlsPhaseSel = 0; run("шаблон: 2 фазы", () => doc.setTlsProgram(n.id, doc.defaultTlsProgram(n.id))); } }, "Шаблон: 2 фазы"),
+        el("button", { title: "Каждый подъезд — своя фаза", onclick: () => { tlsPhaseSel = 0; save("шаблон: по подъездам", (p) => {
+          p.phases = incoming.map((a) => ({ name: `${compass(a.bearing)} · ${a.name}`, green: [a.bearing], dur: 20, yellow: 3, red: 2 }));
+        }); } }, "Шаблон: по подъездам"),
+        el("button", { class: "danger", onclick: () => run("программа по умолчанию", () => doc.setTlsProgram(n.id, null)) }, "Сбросить")),
+      el("p", { class: "muted small" }, "Программа хранится в .osm на узле перекрёстка (тег uds:tls). В SUMO её переводит tools/osm_tls_to_sumo.py: ",
+        "локально — tools/sumo_check.py, на сервере — после установки правки sumo-tls-programs.patch."));
+    return box;
+  }
+
+  function cycleChart(prog, incoming) {
+    const total = cycleOf(prog) || 1;
+    const W = 320, rowH = 16, top = 4, left = 0;
+    const parts = [`<svg viewBox="0 0 ${W} ${incoming.length * (rowH + 4) + 22}" class="tls-chart" role="img" aria-label="Диаграмма цикла">`];
+    incoming.forEach((a, r) => {
+      let t = 0;
+      const y = top + r * (rowH + 4);
+      for (const [k, ph] of prog.phases.entries()) {
+        const g = ph.green.some((b) => angleDiff(b, a.bearing) <= 25);
+        const nxt = prog.phases[(k + 1) % prog.phases.length];
+        const continues = g && nxt.green.some((b) => angleDiff(b, a.bearing) <= 25);
+        const seg = (dur, color) => {
+          if (dur <= 0) return;
+          parts.push(`<rect x="${left + (t / total) * W}" y="${y}" width="${(dur / total) * W}" height="${rowH}" fill="${color}"/>`);
+          t += dur;
+        };
+        seg(+ph.dur || 0, g ? "#2f9e44" : "#e03131");
+        seg(+ph.yellow || 0, g && !continues ? "#fab005" : g ? "#2f9e44" : "#e03131");
+        seg(+ph.red || 0, g && continues ? "#2f9e44" : "#e03131");
+      }
+      parts.push(`<text x="4" y="${y + 12}" font-size="10" fill="#fff">${compass(a.bearing)} · ${a.name.slice(0, 26)}</text>`);
+    });
+    const yAxis = top + incoming.length * (rowH + 4) + 12;
+    for (let s = 0; s <= total; s += total > 120 ? 30 : 10) {
+      parts.push(`<text x="${Math.min((s / total) * W, W - 10)}" y="${yAxis}" font-size="9" fill="var(--muted)">${s}</text>`);
+    }
+    parts.push("</svg>");
+    const d = el("div", {});
+    d.innerHTML = parts.join("");
+    return d;
   }
 
   // ---------------------------------------------------------------------------
@@ -1650,11 +2592,11 @@
   // ---------------------------------------------------------------------------
 
   const AUTOFILL_DEFAULTS = {
-    primary: { lanes: 4, oneLanes: 2, maxspeed: 60 }, secondary: { lanes: 2, oneLanes: 2, maxspeed: 60 },
-    tertiary: { lanes: 2, oneLanes: 1, maxspeed: 60 }, residential: { lanes: 2, oneLanes: 1, maxspeed: 40 },
-    unclassified: { lanes: 2, oneLanes: 1, maxspeed: 40 }, living_street: { lanes: 1, oneLanes: 1, maxspeed: 20 },
-    service: { lanes: 1, oneLanes: 1, maxspeed: 20 }, primary_link: { lanes: 1, oneLanes: 1, maxspeed: 40 },
-    secondary_link: { lanes: 1, oneLanes: 1, maxspeed: 40 }, tertiary_link: { lanes: 1, oneLanes: 1, maxspeed: 40 },
+    primary: { lanes: 4, oneLanes: 2, maxspeed: 60, laneWidth: 3.5, surface: "asphalt" }, secondary: { lanes: 2, oneLanes: 2, maxspeed: 60, laneWidth: 3.5, surface: "asphalt" },
+    tertiary: { lanes: 2, oneLanes: 1, maxspeed: 60, laneWidth: 3.25, surface: "asphalt" }, residential: { lanes: 2, oneLanes: 1, maxspeed: 40, laneWidth: 3.0, surface: "asphalt" },
+    unclassified: { lanes: 2, oneLanes: 1, maxspeed: 40, laneWidth: 3.0, surface: "asphalt" }, living_street: { lanes: 1, oneLanes: 1, maxspeed: 20, laneWidth: 3.0, surface: "asphalt" },
+    service: { lanes: 1, oneLanes: 1, maxspeed: 20, laneWidth: 3.0, surface: "asphalt" }, primary_link: { lanes: 1, oneLanes: 1, maxspeed: 40, laneWidth: 3.5, surface: "asphalt" },
+    secondary_link: { lanes: 1, oneLanes: 1, maxspeed: 40, laneWidth: 3.5, surface: "asphalt" }, tertiary_link: { lanes: 1, oneLanes: 1, maxspeed: 40, laneWidth: 3.25, surface: "asphalt" },
   };
 
   function autofillBlock() {
@@ -2009,7 +2951,7 @@
     if (!server.token()) return toast("Введите токен команды");
     runValidation();
     const errors = state.issues.filter((i) => i.severity === "error").length;
-    if (errors && !confirm(`Есть ${errors} ${plural(errors, "ошибка", "ошибки", "ошибок")} графа — прогон на сервере может упасть. Всё равно отправить?`)) return;
+    if (errors && !confirm(`Есть ${errors} ${plural(errors, "ошибка", "ошибки", "ошибок")} графа — эти места будут работать в симуляции неправильно. Всё равно отправить?`)) return;
     const form = new FormData();
     form.append("osm", new Blob([state.doc.serialize()], { type: "application/xml" }), team + ".osm");
     status.replaceChildren("Отправка…");
@@ -2073,6 +3015,7 @@
     state.view = e.target.value;
     if (!state.doc) return;
     for (const w of state.doc.ways.values()) if (category(w) === "roads" || category(w) === "foot") drawWay(w.id);
+    scheduleLanes();
     drawSelection();
     renderPanel();
   });
@@ -2119,6 +3062,7 @@
       sign: "Знак: выберите знак сверху и кликните по дороге; клик по знаку того же типа — убрать",
       crossing: "Переход: наземный — клик по дороге; надземный и подземный — рисуются линией поперёк дороги",
       measure: "Линейка: клики по карте — точки, Esc — заново",
+      stop: "Остановка: клик по карте у дороги ставит остановку, зона доступности пересчитается",
     }[state.mode];
     $("#status-mode").textContent = modeText;
     $("#status-file").textContent = doc ? state.fileLabel + (doc.dirty ? " • не сохранено" : "") : "Файл не открыт";
@@ -2154,6 +3098,59 @@
     if (map.hasLayer(grp)) { map.removeLayer(grp); toast(name + " скрыты"); } else { map.addLayer(grp); toast(name + " показаны"); }
   }
 
+  // ----- горячие клавиши: действие → физическая клавиша (KeyboardEvent.code), можно переназначить -----
+  const KEY_ACTIONS = {
+    select: { name: "Режим выбора", def: "KeyV", run: () => setMode("select") },
+    draw: { name: "Нарисовать дорогу", def: "KeyN", run: () => setMode("draw") },
+    signal: { name: "Светофор", def: "KeyT", run: () => setMode("signal") },
+    sign: { name: "Дорожный знак", def: "KeyS", run: () => setMode("sign") },
+    crossing: { name: "Пешеходный переход", def: "KeyP", run: () => setMode("crossing") },
+    stop: { name: "Поставить остановку", def: "KeyO", run: () => setMode("stop") },
+    measure: { name: "Линейка", def: "KeyM", run: () => setMode("measure") },
+    view3d: { name: "3D-просмотр", def: "Digit3", run: () => open3d() },
+    traj: { name: "Траектории манёвров", def: "KeyJ", run: () => toggleTraj() },
+    foot: { name: "Скрыть/показать тротуары", def: "KeyF", run: () => toggleLayer(g.foot, "Тротуары и тропы") },
+    buildings: { name: "Скрыть/показать здания", def: "KeyB", run: () => toggleLayer(g.buildings, "Здания") },
+    reverse: { name: "Развернуть дорогу", def: "KeyR", run: (s) => { if (s && s.type === "way") run("развернуть", () => state.doc.reverseWay(s.id)); } },
+    split: { name: "Разрезать дорогу в узле", def: "KeyX", run: (s) => { if (s && s.type === "node" && s.way) run("разрезать", () => state.doc.splitWay(s.way, s.id)); } },
+  };
+  const keymap = {};
+  try { Object.assign(keymap, JSON.parse(localStorage.getItem("uds-keys") || "{}")); } catch (e) { /* без сохранённых настроек */ }
+  for (const [a, d] of Object.entries(KEY_ACTIONS)) if (!keymap[a]) keymap[a] = d.def;
+  let keyCapture = null;
+  const keyLabel = (code) => (code || "").replace(/^Key/, "").replace(/^Digit/, "").replace(/^Numpad/, "Num ");
+
+  function keysBlock() {
+    const box = el("div", { class: "keys" });
+    for (const [a, d] of Object.entries(KEY_ACTIONS)) {
+      const btn = el("button", { class: "key-btn", title: "Нажмите и затем новую клавишу" }, keyLabel(keymap[a]));
+      btn.addEventListener("click", () => {
+        keyCapture = a;
+        btn.textContent = "нажмите…";
+        const onKey = (e) => {
+          e.preventDefault(); e.stopPropagation();
+          document.removeEventListener("keydown", onKey, true);
+          keyCapture = null;
+          if (e.key !== "Escape") {
+            const taken = Object.keys(keymap).find((x) => x !== a && keymap[x] === e.code);
+            if (taken) keymap[taken] = keymap[a]; // поменять местами, чтобы не было двух действий на одной клавише
+            keymap[a] = e.code;
+            try { localStorage.setItem("uds-keys", JSON.stringify(keymap)); } catch (err) { /* без сохранения */ }
+          }
+          renderHelp(true);
+        };
+        document.addEventListener("keydown", onKey, true);
+      });
+      box.append(el("span", {}, d.name), btn);
+    }
+    box.append(el("span", {}, ""), el("button", { onclick: () => {
+      for (const [a, d] of Object.entries(KEY_ACTIONS)) keymap[a] = d.def;
+      try { localStorage.removeItem("uds-keys"); } catch (err) { /* ничего */ }
+      renderHelp(true);
+    } }, "По умолчанию"));
+    return box;
+  }
+
   document.addEventListener("keydown", (e) => {
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
     const ctrl = e.ctrlKey || e.metaKey;
@@ -2164,23 +3161,15 @@
     if (ctrl && (k === "z" || k === "я")) { e.preventDefault(); if (state.doc) (e.shiftKey ? state.doc.redo() : state.doc.undo()); return; }
     if (ctrl && (k === "y" || k === "н")) { e.preventDefault(); if (state.doc) state.doc.redo(); return; }
     if (ctrl || e.altKey) return;
+    if (keyCapture) return;
     const s = state.sel;
-    switch (e.key === "Delete" || e.key === "Backspace" || e.key === "Escape" || e.key === "Enter" ? e.key : k) {
-      case "v": case "м": setMode("select"); break;
-      case "n": case "т": setMode("draw"); break;
-      case "t": case "е": setMode("signal"); break;
-      case "s": case "ы": setMode("sign"); break;
-      case "p": case "з": setMode("crossing"); break;
-      case "m": case "ь": setMode("measure"); break;
-      case "3": open3d(); break;
-      case "f": case "а": toggleLayer(g.foot, "Тротуары и тропы"); break;
-      case "b": case "и": toggleLayer(g.buildings, "Здания"); break;
-      case "r": case "к":
-        if (s && s.type === "way") run("развернуть", () => state.doc.reverseWay(s.id));
-        break;
-      case "x": case "ч":
-        if (s && s.type === "node" && s.way) run("разрезать", () => state.doc.splitWay(s.way, s.id));
-        break;
+    const action = Object.keys(keymap).find((a) => keymap[a] === e.code);
+    if (action && !["Delete", "Backspace", "Escape", "Enter"].includes(e.key)) {
+      const fn = KEY_ACTIONS[action];
+      if (fn) { e.preventDefault(); fn.run(s); }
+      return;
+    }
+    switch (e.key) {
       case "Enter": if (state.mode === "draw") finishDraw(); break;
       case "Escape":
         if (!$("#qr-dialog").hidden) { $("#qr-dialog").hidden = true; break; }

@@ -23,6 +23,12 @@
     "unclassified", "residential", "living_street", "service", "road",
   ]);
 
+  // Дворы и проезды: тупики и односторонние въезды здесь — обычное дело
+  const YARD = new Set(["service", "living_street"]);
+  const isYard = (w) => YARD.has(w.tags.highway);
+  // OSM-тег noexit=yes на конце дороги — «тупик здесь настоящий», проверка его не трогает
+  const isNoExit = (n) => !!n && n.tags.noexit === "yes";
+
   const KEY_ORDER_NODE = ["id", "visible", "version", "changeset", "timestamp", "user", "uid", "lat", "lon"];
 
   function isDrivable(way) {
@@ -59,6 +65,65 @@
   function projector(lat0) {
     const k = Math.cos(rad(lat0));
     return (p) => ({ x: rad(p.lon) * k * R, y: rad(p.lat) * R });
+  }
+
+  /** Азимут от a к b: 0 — север, 90 — восток. */
+  function bearing(a, b) {
+    const dy = b.lat - a.lat, dx = (b.lon - a.lon) * Math.cos(rad((a.lat + b.lat) / 2));
+    return ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360;
+  }
+  function angleDiff(a, b) { const d = Math.abs(a - b) % 360; return Math.min(d, 360 - d); }
+
+  /**
+   * Плавное сужение/расширение проезжей части у стыка с продолжением.
+   * own — свой профиль {left,right,axis}; startT/endT — профиль продолжения на концах (или null).
+   * Возвращает профиль в точке на расстояниях dStart и dEnd от концов линии; длина перехода — taper метров.
+   */
+  function taperProfile(dStart, dEnd, own, startT, endT, taper) {
+    const smooth = (t) => t * t * (3 - 2 * t);
+    const mix = (a, b, t) => ({ left: a.left + (b.left - a.left) * t, right: a.right + (b.right - a.right) * t, axis: a.axis + (b.axis - a.axis) * t });
+    let p = { left: own.left, right: own.right, axis: own.axis };
+    // на стыке берём середину между своим профилем и профилем продолжения: обе линии сходятся в одной ширине
+    const at = (t) => (t.exact ? t : mix(own, t, 0.5));
+    if (endT && dEnd < taper) p = mix(at(endT), p, smooth(dEnd / taper));
+    if (startT && dStart < taper) p = mix(at(startT), p, smooth(dStart / taper));
+    return p;
+  }
+
+  /** Добавить точки на ломаной через каждые step метров в пределах taper от концов (для плавных переходов). */
+  function densify(pts, taper, step, X, Y) {
+    const d = [0];
+    for (let i = 1; i < pts.length; i++) d.push(d[i - 1] + Math.hypot(pts[i][X] - pts[i - 1][X], pts[i][Y] - pts[i - 1][Y]));
+    const total = d[d.length - 1];
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      out.push({ p: pts[i], s: d[i] });
+      if (i === pts.length - 1) break;
+      for (let s = d[i] + step; s < d[i + 1] - 0.5; s += step) {
+        if (s > taper && s < total - taper) continue;
+        const t = (s - d[i]) / (d[i + 1] - d[i]);
+        const q = {};
+        for (const k of Object.keys(pts[i])) q[k] = typeof pts[i][k] === "number" ? pts[i][k] + (pts[i + 1][k] - pts[i][k]) * t : pts[i][k];
+        out.push({ p: q, s });
+      }
+    }
+    return { pts: out.map((o) => o.p), dist: out.map((o) => o.s), total };
+  }
+
+  /** Значение стрелки OSM → тип манёвра. */
+  function turnClass(v) {
+    if (/left/.test(v)) return "left";
+    if (/right/.test(v)) return "right";
+    if (v === "reverse") return "reverse";
+    if (v === "through" || /merge/.test(v)) return "through";
+    return v;
+  }
+
+  /** Уровень обслуживания по средней задержке (как в HCM для регулируемых перекрёстков). */
+  function los(delay, x) {
+    if (x >= 1) return "F";
+    if (delay == null) return null;
+    return delay <= 10 ? "A" : delay <= 20 ? "B" : delay <= 35 ? "C" : delay <= 55 ? "D" : delay <= 80 ? "E" : "F";
   }
 
   function segIntersect(p1, p2, p3, p4) {
@@ -585,6 +650,538 @@
       return count;
     }
 
+    // ----- светофоры -----
+
+    /** Подъезды к перекрёстку: направление (от узла к соседней точке), название, можно ли подъехать. */
+    approaches(nodeId) {
+      const n = this.nodes.get(nodeId);
+      const list = [];
+      for (const w of this.waysOfNode(nodeId)) {
+        if (!isDrivable(w)) continue;
+        const d = onewayDir(w);
+        w.nodes.forEach((id, i) => {
+          if (id !== nodeId) return;
+          for (const [k, towardJunction] of [[i - 1, d >= 0], [i + 1, d <= 0]]) {
+            if (k < 0 || k >= w.nodes.length) continue;
+            const m = this.nodes.get(w.nodes[k]);
+            const b = bearing(n, m);
+            // side — с какой стороны линии едут к перекрёстку: forward — по направлению рисования
+            list.push({ bearing: Math.round(b), name: w.tags.name || w.tags.highway, way: w.id, incoming: towardJunction,
+              outgoing: k === i - 1 ? d <= 0 : d >= 0, side: k === i - 1 ? "forward" : "backward", lanes: this.lanesOf(w) });
+          }
+        });
+      }
+      // сливаем почти совпадающие направления (две линии одной улицы)
+      list.sort((a, b) => a.bearing - b.bearing);
+      const merged = [];
+      for (const a of list) {
+        const m = merged.find((x) => angleDiff(x.bearing, a.bearing) < 20);
+        if (m) { m.incoming = m.incoming || a.incoming; m.outgoing = m.outgoing || a.outgoing; if (!m.name && a.name) m.name = a.name; }
+        else merged.push({ ...a });
+      }
+      return merged;
+    }
+
+    // ----- запреты манёвров (отношения type=restriction) -----
+
+    /** Запреты манёвров с узлом-перекрёстком via: {id, kind, only, from, to}. */
+    restrictionsAt(nodeId) {
+      if (!this._restrIndex || this._restrIndexVer !== this.undoStack.length + ":" + this.redoStack.length + ":" + this.relations.size) {
+        const idx = new Map();
+        for (const r of this.relations.values()) {
+          if (r.tags.type !== "restriction") continue;
+          const kind = r.tags.restriction || r.tags["restriction:motorcar"];
+          if (!kind) continue;
+          const from = r.members.find((m) => m.role === "from" && m.type === "way");
+          const via = r.members.find((m) => m.role === "via" && m.type === "node");
+          const to = r.members.find((m) => m.role === "to" && m.type === "way");
+          if (!from || !via || !to) continue;
+          if (!idx.has(via.ref)) idx.set(via.ref, []);
+          idx.get(via.ref).push({ id: r.id, kind, only: kind.startsWith("only_"), from: from.ref, to: to.ref });
+        }
+        this._restrIndex = idx;
+        this._restrIndexVer = this.undoStack.length + ":" + this.redoStack.length + ":" + this.relations.size;
+      }
+      return this._restrIndex.get(nodeId) || [];
+    }
+
+    /** Все запреты манёвров с координатами — для знаков на карте. */
+    restrictions() {
+      const out = [];
+      for (const r of this.relations.values()) {
+        if (r.tags.type !== "restriction") continue;
+        const via = r.members.find((m) => m.role === "via" && m.type === "node");
+        const from = r.members.find((m) => m.role === "from" && m.type === "way");
+        if (!via || !from || !this.nodes.has(via.ref) || !this.ways.has(from.ref)) continue;
+        const n = this.nodes.get(via.ref), w = this.ways.get(from.ref);
+        // знак ставим на подъезде, в 15 м до перекрёстка
+        const k = w.nodes.indexOf(via.ref);
+        const nb = this.nodes.get(w.nodes[k > 0 ? k - 1 : k + 1]);
+        if (!nb) continue;
+        const d = distM(n, nb), t = Math.min(1, 15 / (d || 1));
+        out.push({ id: r.id, kind: r.tags.restriction || r.tags["restriction:motorcar"], via: via.ref, from: from.ref,
+          lat: n.lat + (nb.lat - n.lat) * t, lon: n.lon + (nb.lon - n.lon) * t });
+      }
+      return out;
+    }
+
+    // ----- общественный транспорт -----
+
+    /** Маршруты ОТ из отношений route=bus/trolleybus/tram/…: линии и остановки, что есть в файле. */
+    transitRoutes() {
+      const TYPES = ["bus", "trolleybus", "tram", "minibus", "share_taxi"];
+      const out = [];
+      for (const r of this.relations.values()) {
+        if (r.tags.type !== "route" || !TYPES.includes(r.tags.route)) continue;
+        const ways = r.members.filter((m) => m.type === "way" && !/platform/.test(m.role) && this.ways.has(m.ref)).map((m) => m.ref);
+        const stops = r.members.filter((m) => m.type === "node" && /stop|platform/.test(m.role) && this.nodes.has(m.ref)).map((m) => m.ref);
+        if (!ways.length && !stops.length) continue;
+        out.push({ id: r.id, mode: r.tags.route, ref: r.tags.ref || "", name: r.tags.name || r.tags.ref || r.id, colour: r.tags.colour, ways, stops });
+      }
+      return out.sort((a, b) => a.mode.localeCompare(b.mode) || (parseInt(a.ref, 10) || 0) - (parseInt(b.ref, 10) || 0) || a.ref.localeCompare(b.ref));
+    }
+
+    /** Остановки ОТ в файле. */
+    transitStops() {
+      const out = [];
+      for (const n of this.nodes.values()) {
+        const t = n.tags;
+        if (t.highway === "bus_stop" || t.railway === "tram_stop" || t.public_transport === "platform" || t.public_transport === "stop_position" || t.amenity === "bus_station") {
+          out.push({ id: n.id, lat: n.lat, lon: n.lon, name: t.name || "Остановка", kind: t.railway === "tram_stop" ? "tram" : t.trolleybus === "yes" ? "trolleybus" : "bus", user: t["uds:user"] === "yes" });
+        }
+      }
+      return out;
+    }
+
+    /** Новая остановка (внутри edit): точка у дороги с тегами OSM по схеме public_transport. */
+    addStop(lat, lon, name) {
+      return this.addNode(lat, lon, { highway: "bus_stop", public_transport: "platform", bus: "yes", name: name || "Новая остановка", "uds:user": "yes" });
+    }
+
+    // ----- полосы и стрелки -----
+
+    /** Ключ тега стрелок для направления: oneway → turn:lanes, иначе :forward / :backward. */
+    turnKey(way, side) {
+      return onewayDir(way) !== 0 ? "turn:lanes" : "turn:lanes:" + side;
+    }
+
+    /** Стрелки по полосам (слева направо по ходу движения). Пустая строка — не указано. */
+    turnLanes(way, side) {
+      const l = this.lanesOf(way);
+      const n = onewayDir(way) !== 0 ? (l.total || 0) : side === "forward" ? (l.forward || 0) : (l.backward || 0);
+      const raw = way.tags[this.turnKey(way, side)];
+      const parts = raw ? raw.split("|") : [];
+      return Array.from({ length: n }, (_, i) => (parts[i] || "").replace(/^none$/, ""));
+    }
+
+    /**
+     * Стрелки по умолчанию для полос подъезда — по разрешённым манёврам на перекрёстке в конце:
+     * 1 полоса — все манёвры; 2 — левая «налево+прямо», правая «прямо+направо»;
+     * 3 и больше — крайняя левая «налево», крайняя правая «прямо+направо», средние «прямо».
+     */
+    defaultTurnLanes(way, side) {
+      const n = this.turnLanes(way, side).length;
+      if (!n) return [];
+      const one = onewayDir(way) !== 0;
+      const forwardTravel = one ? onewayDir(way) > 0 : side === "forward";
+      const junction = forwardTravel ? way.nodes[way.nodes.length - 1] : way.nodes[0];
+      const avail = new Set(this.movements(junction)
+        .filter((m) => m.from.way === way.id && m.type !== "reverse" && (!m.restriction))
+        .map((m) => m.type));
+      if (!avail.size) return Array(n).fill("");
+      const L = avail.has("left"), T = avail.has("through"), R = avail.has("right");
+      const j = (...xs) => xs.filter(Boolean).join(";");
+      if (n === 1) return [j(L && "left", T && "through", R && "right")];
+      if (n === 2) return [j(L && "left", T && "through") || j(R && "right"), j(T && "through", R && "right") || j(L && "left")];
+      return Array.from({ length: n }, (_, i) => i === 0 ? (L ? "left" : j(T && "through")) : i === n - 1 ? j(T && "through", R && "right") || "through" : (T ? "through" : (L ? "left" : "right")));
+    }
+
+    setTurnLanes(wayId, side, lanes) {
+      const w = this.ways.get(wayId);
+      const key = this.turnKey(w, side);
+      const val = lanes.some((x) => x) ? lanes.map((x) => x || "none").join("|") : "";
+      this.setTag("way", wayId, key, val);
+    }
+
+    /**
+     * Манёвры на перекрёстке: каждый въезд × каждый выезд, тип поворота и разрешён ли он.
+     * Разрешение — по стрелкам на полосах (turn:lanes), если они указаны; разворот — только по стрелке.
+     */
+    movements(nodeId) {
+      const appr = this.approaches(nodeId);
+      const out = [];
+      for (const a of appr.filter((x) => x.incoming)) {
+        const w = this.ways.get(a.way);
+        const lanes = w ? this.turnLanes(w, onewayDir(w) !== 0 ? "forward" : a.side) : [];
+        const allowedSet = new Set(lanes.flatMap((l) => l.split(";")).filter(Boolean).map(turnClass));
+        const heading = (a.bearing + 180) % 360; // куда едут на подъезде
+        const rest = this.restrictionsAt(nodeId).filter((r) => r.from === a.way);
+        for (const b of appr.filter((x) => x.outgoing)) {
+          let delta = ((b.bearing - heading + 540) % 360) - 180;
+          const same = angleDiff(a.bearing, b.bearing) < 20;
+          const type = same ? "reverse" : Math.abs(delta) < 30 ? "through" : delta > 0 ? "right" : "left";
+          let allowed = allowedSet.size ? allowedSet.has(type) : type !== "reverse";
+          // запреты манёвров из файла (отношения restriction) — их же читает SUMO
+          let byRestriction = null;
+          for (const r of rest) {
+            if (r.only && r.to !== b.way) { allowed = false; byRestriction = r; }
+            if (!r.only && r.to === b.way) { allowed = false; byRestriction = r; }
+            if (r.only && r.to === b.way && type === "reverse") { allowed = true; }
+          }
+          out.push({ from: a, to: b, type, allowed, delta, restriction: byRestriction });
+        }
+      }
+      return out;
+    }
+
+    // ----- геометрия проезжей части для отрисовки (2D-полосы и 3D) -----
+
+    /** Полосы для отрисовки: если не указаны — умолчание по классу дороги. */
+    renderLanes(w) {
+      const DEF = { motorway: 4, trunk: 4, primary: 4, secondary: 2, tertiary: 2, unclassified: 2, residential: 2, living_street: 1, service: 1, road: 2 };
+      const hw = w.tags.highway || "";
+      const base = DEF[hw.replace("_link", "")] || 1;
+      const l = this.lanesOf(w);
+      if (onewayDir(w) !== 0) return { f: l.total || (hw.endsWith("_link") ? 1 : Math.max(1, Math.ceil(base / 2))), b: 0, known: !!l.total };
+      let f = l.forward, b = l.backward;
+      if (f == null || b == null) { const t = l.total || base; f = Math.max(1, Math.ceil(t / 2)); b = Math.max(t - f, t > 1 ? 1 : 0); }
+      return { f, b, known: l.known };
+    }
+
+    /** Поперечный профиль: смещения левой и правой кромки и оси от линии (метры, влево — плюс). */
+    crossSection(w) {
+      const { f, b, known } = this.renderLanes(w);
+      const tw = parseFloat(w.tags.width);
+      const width = tw > 0 ? tw : (f + b) * 3.2;
+      const laneW = width / Math.max(f + b, 1);
+      const half = width / 2;
+      return { f, b, known, laneW, width, left: half, right: -half, axis: half - b * laneW };
+    }
+
+    /**
+     * Профиль на конце линии так, как его надо видеть с этой линии: если дорога продолжается
+     * другой линией почти прямо (та же улица разбита на части), берём профиль продолжения —
+     * тогда края и разметка сходятся, а лишняя полоса плавно сужается, а не обрывается ступенькой.
+     */
+    _continuation(w, atEnd) {
+      const id = atEnd ? w.nodes[w.nodes.length - 1] : w.nodes[0];
+      const prev = this.nodes.get(atEnd ? w.nodes[w.nodes.length - 2] : w.nodes[1]);
+      const node = this.nodes.get(id);
+      const heading = bearing(prev, node); // направление «наружу» через конец линии
+      let best = null;
+      const cands = [];
+      const here = this.waysOfNode(id).filter(isDrivable);
+      for (const o of here) {
+        if (o.id === w.id || o.nodes.length < 2) continue;
+        // продолжение — это та же дорога, разбитая на части: стык ровно двух линий или та же улица
+        // того же класса. Съезд, вливающийся в магистраль, ширину магистрали не наследует.
+        const sameStreet = w.tags.name && o.tags.name === w.tags.name && o.tags.highway === w.tags.highway;
+        if (here.length > 2 && !sameStreet) continue;
+        if (here.length === 2 && (o.tags.highway || "").endsWith("_link") !== (w.tags.highway || "").endsWith("_link")) continue;
+        const k = o.nodes.indexOf(id);
+        for (const step of [1, -1]) {
+          const m = o.nodes[k + step];
+          if (m === undefined) continue;
+          const d = angleDiff(heading, bearing(node, this.nodes.get(m)));
+          if (d < 35) {
+            cands.push({ o, sameDir: (step === 1) === atEnd });
+            if (!best || d < best.d) best = { o, d, sameDir: (step === 1) === atEnd };
+          }
+        }
+      }
+      // дорога расходится на две проезжие части (или две сходятся в одну) — это не продолжение
+      if (best) best.all = cands;
+      if (!best || new Set(cands.map((c) => c.o.id)).size > 1) return best ? Object.assign(best, { ambiguous: true }) : null;
+      return best;
+    }
+
+    endProfile(w, atEnd) {
+      const best = this._continuation(w, atEnd);
+      if (!best) return null;
+      const toFrame = (c) => {
+        const p = this.crossSection(c.o);
+        return c.sameDir ? { left: p.left, right: p.right, axis: p.axis } : { left: -p.right, right: -p.left, axis: -p.axis };
+      };
+      // Двусторонняя улица расходится на две односторонние проезжие части: каждая часть у стыка
+      // занимает свою половину улицы и дальше плавно отходит — без ступеньки.
+      if (onewayDir(w) !== 0) {
+        const two = (best.all || []).find((c) => onewayDir(c.o) === 0 && c.o.tags.name && c.o.tags.name === w.tags.name);
+        const id0 = atEnd ? w.nodes[w.nodes.length - 1] : w.nodes[0];
+        const split = two && this._continuation(two.o, two.o.nodes[two.o.nodes.length - 1] === id0);
+        if (two && split && split.ambiguous) {
+          const t = toFrame(two);
+          return onewayDir(w) > 0 ? { left: t.axis, right: t.right, axis: t.axis, exact: true }
+                                  : { left: t.left, right: t.axis, axis: t.axis, exact: true };
+        }
+      }
+      if (best.ambiguous) return null;
+      // продолжение должно быть взаимным: иначе одна сторона сузится, а другая нет — опять ступенька
+      const id = atEnd ? w.nodes[w.nodes.length - 1] : w.nodes[0];
+      const back = this._continuation(best.o, best.o.nodes[best.o.nodes.length - 1] === id);
+      if (!back || back.o.id !== w.id) return null;
+      const p = this.crossSection(best.o);
+      // у продолжения, нарисованного навстречу, лево и право меняются местами
+      return best.sameDir ? { left: p.left, right: p.right, axis: p.axis }
+                          : { left: -p.right, right: -p.left, axis: -p.axis };
+    }
+
+    // ----- знаки приоритета по данным -----
+
+    /**
+     * Где по данным графа нужны знаки приоритета на нерегулируемых перекрёстках:
+     * второстепенные подъезды (ниже классом) — «Уступите дорогу» (2.4); с opts.main ещё и
+     * главные — «Главная дорога» (2.1). Выезды из дворов (service, living_street) пропускаются.
+     * Так же приоритет определяет SUMO: по классу дороги. Знаки ставятся в 12 м до перекрёстка.
+     */
+    suggestSigns(opts) {
+      opts = opts || {};
+      const RANK = { motorway: 7, trunk: 6, primary: 5, secondary: 4, tertiary: 3, unclassified: 2, residential: 2, road: 2, living_street: 1, service: 1 };
+      const rank = (w) => { const h = w.tags.highway || ""; return (RANK[h.replace("_link", "")] || 0) - (h.endsWith("_link") ? 0.5 : 0); };
+      const out = [];
+      for (const [id] of this.nodeWays) {
+        const n = this.nodes.get(id);
+        if (n.tags.highway === "traffic_signals" || n.tags["uds:tls"]) continue;
+        const appr = this.approaches(id).filter((a) => a.incoming);
+        if (appr.length < 3) continue;
+        const ranks = appr.map((a) => rank(this.ways.get(a.way)));
+        const top = Math.max(...ranks);
+        if (ranks.every((r) => r === top)) continue; // равнозначный перекрёсток — «правило правой руки»
+        // выезды из дворов и с прилегающей территории знаков не требуют (ПДД 8.3)
+        const minor = appr.filter((a, i) => ranks[i] < top && !isYard(this.ways.get(a.way)));
+        if (!minor.length) continue;
+        appr.forEach((a, i) => {
+          const w = this.ways.get(a.way);
+          const kind = ranks[i] === top ? "main" : "give_way";
+          if (kind === "give_way" && isYard(w)) return;
+          if (kind === "main" && !opts.main) return;
+          // точка в 12 м от перекрёстка по подъезду
+          const k = w.nodes.indexOf(id);
+          const step = a.side === "forward" ? -1 : 1;
+          let dist = 0, p = n, q = null;
+          for (let j = k + step; j >= 0 && j < w.nodes.length; j += step) {
+            q = this.nodes.get(w.nodes[j]);
+            const seg = distM(p, q);
+            if (dist + seg >= 12) { const t = (12 - dist) / seg; out.push({ junction: id, way: w.id, side: a.side, kind, name: a.name, seg: step < 0 ? j : j - 1, lat: p.lat + (q.lat - p.lat) * t, lon: p.lon + (q.lon - p.lon) * t }); return; }
+            dist += seg; p = q;
+          }
+        });
+      }
+      // уже стоящие знаки не дублируем
+      const existing = [...this.nodes.values()].filter((x) => x.tags.highway === "give_way" || x.tags.traffic_sign === "RU:2.4" || x.tags.traffic_sign === "RU:2.1");
+      return out.filter((sg) => !existing.some((x) => distM(x, sg) < 20 && (x.tags.traffic_sign === "RU:2.1") === (sg.kind === "main")));
+    }
+
+    /** Записать предложенные знаки в граф: новые узлы на подъездах (внутри edit). */
+    placeSigns(list) {
+      let count = 0;
+      for (const sg of list) {
+        const w = this.ways.get(sg.way);
+        if (!w) continue;
+        // отрезок мог сдвинуться от вставок — ищем ближайший
+        let best = 0, bd = Infinity;
+        for (let i = 1; i < w.nodes.length; i++) {
+          const a = this.nodes.get(w.nodes[i - 1]), b = this.nodes.get(w.nodes[i]);
+          const d = distM(sg, { lat: (a.lat + b.lat) / 2, lon: (a.lon + b.lon) / 2 });
+          if (d < bd) { bd = d; best = i - 1; }
+        }
+        const id = this.insertNode(sg.way, best, sg.lat, sg.lon);
+        const tags = sg.kind === "main" ? { traffic_sign: "RU:2.1" } : { highway: "give_way", traffic_sign: "RU:2.4" };
+        if (onewayDir(w) === 0) tags.direction = sg.side;
+        this.setTags("node", id, tags);
+        count++;
+      }
+      return count;
+    }
+
+    // ----- расчёт регулируемого перекрёстка (метод Вебстера) -----
+
+    /**
+     * Пропускная способность, задержка и очередь по подъездам при заданных интенсивностях.
+     * prog.flows: { "<азимут подъезда>": авт/ч }. Поток насыщения — 1800 авт/ч на полосу.
+     */
+    tlsCapacity(nodeId, prog) {
+      prog = prog || this.tlsProgram(nodeId);
+      if (!prog) return null;
+      const appr = this.approaches(nodeId).filter((a) => a.incoming);
+      const flows = prog.flows || {};
+      const flowOf = (a) => {
+        const k = Object.keys(flows).find((b) => angleDiff(+b, a.bearing) <= 25);
+        return k ? +flows[k] || 0 : 0;
+      };
+      const lanesIn = (a) => {
+        const w = this.ways.get(a.way);
+        if (!w) return 1;
+        const l = this.lanesOf(w);
+        const n = onewayDir(w) !== 0 ? l.total : a.side === "forward" ? l.forward : l.backward;
+        return Math.max(1, n || (l.total ? Math.ceil(l.total / 2) : 1));
+      };
+      const phases = prog.phases;
+      const cycle = phases.reduce((s, p) => s + (+p.dur || 0) + (+p.yellow || 0) + (+p.red || 0), 0);
+      const lost = phases.reduce((s, p) => s + (+p.yellow || 0) + (+p.red || 0), 0);
+      const inPhase = (p, a) => p.green.some((g) => angleDiff(g, a.bearing) <= 25);
+      const rows = appr.map((a) => {
+        const q = flowOf(a), n = lanesIn(a), s = 1800 * n;
+        const g = phases.filter((p) => inPhase(p, a)).reduce((t, p) => t + (+p.dur || 0) + (+p.yellow || 0), 0);
+        const lam = cycle ? g / cycle : 0;
+        const cap = s * lam;
+        const x = cap ? q / cap : (q ? Infinity : 0);
+        const qs = q / 3600, ss = s / 3600, r = cycle - g;
+        let delay = null, queue = null;
+        if (q > 0 && x < 1 && lam > 0) {
+          // Вебстер: равномерная составляющая + случайная, с поправочным коэффициентом 0,9
+          delay = 0.9 * ((cycle * (1 - lam) ** 2) / (2 * (1 - lam * x)) + (x * x) / (2 * qs * (1 - x)));
+          // очередь к началу зелёного: машины, пришедшие за красный, плюс доезжающие пока очередь рассасывается
+          const veh = (qs * r) / (1 - qs / ss);
+          queue = { veh: Math.ceil(veh), m: Math.round((veh / n) * 7) };
+        }
+        return { bearing: a.bearing, name: a.name, lanes: n, flow: q, sat: s, green: g, capacity: Math.round(cap), x, delay, queue, los: los(delay, x) };
+      });
+      // критические отношения фаз и оптимальный цикл Вебстера
+      const ys = phases.map((p) => Math.max(0, ...rows.filter((r) => inPhase(p, r)).map((r) => (r.flow || 0) / r.sat)));
+      const Y = ys.reduce((a, b) => a + b, 0);
+      const C0 = Y < 0.95 && Y > 0 ? Math.min(150, Math.max(40, Math.round((1.5 * lost + 5) / (1 - Y)))) : null;
+      const withFlow = rows.filter((r) => r.flow > 0 && r.delay != null);
+      const avgDelay = withFlow.length ? withFlow.reduce((s, r) => s + r.delay * r.flow, 0) / withFlow.reduce((s, r) => s + r.flow, 0) : null;
+      return { rows, cycle, lost, Y, C0, ys, avgDelay, los: los(avgDelay, Math.max(0, ...rows.map((r) => r.x).filter(Number.isFinite))) };
+    }
+
+    /**
+     * Имитация работы регулируемого перекрёстка без визуализации (по секундам, модель очередей).
+     * Машины приходят случайно (поток Пуассона с заданной интенсивностью), на зелёном уезжают
+     * с интервалом насыщения 2 с на полосу после 2 с потерь на старт; на жёлтом — первые 2 с.
+     * Возвращает показатели по подъездам и в целом за duration секунд, среднее по runs прогонам.
+     */
+    simulateJunction(nodeId, prog, opts) {
+      opts = Object.assign({ duration: 3600, runs: 5, seed: 11, headway: 2, startLoss: 2, carLen: 7 }, opts || {});
+      prog = prog || this.tlsProgram(nodeId);
+      const cap = this.tlsCapacity(nodeId, prog);
+      if (!cap) return null;
+      const phases = prog.phases;
+      // расписание сигнала по секундам цикла для каждого подъезда: 2 — зелёный, 1 — жёлтый, 0 — красный
+      const cycle = cap.cycle;
+      const inPhase = (p, b) => p.green.some((g) => angleDiff(g, b) <= 25);
+      const rows = cap.rows.map((r) => {
+        const sig = new Uint8Array(cycle);
+        let t = 0;
+        for (const p of phases) {
+          const g = inPhase(p, r.bearing);
+          for (let k = 0; k < (+p.dur || 0); k++, t++) sig[t] = g ? 2 : 0;
+          for (let k = 0; k < (+p.yellow || 0); k++, t++) sig[t] = g ? 1 : 0;
+          for (let k = 0; k < (+p.red || 0); k++, t++) sig[t] = 0;
+        }
+        // когда машины могут уезжать: зелёный после потерь на старт и первые 2 с жёлтого
+        const go = new Uint8Array(cycle);
+        for (let i = 0, g = 0, y = 0; i < 2 * cycle; i++) {
+          const sg = sig[i % cycle];
+          g = sg === 2 ? g + 1 : 0; y = sg === 1 ? y + 1 : 0;
+          go[i % cycle] = (sg === 2 && g > opts.startLoss) || (sg === 1 && y <= 2) ? 1 : 0;
+        }
+        return { ...r, sig, go };
+      });
+      let seed = opts.seed;
+      const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+      const res = rows.map((r) => ({ bearing: r.bearing, name: r.name, lanes: r.lanes, flow: r.flow, arrived: 0, departed: 0, delaySum: 0, stopped: 0, maxQueue: 0, queueSum: 0, overflowCycles: 0, cycles: 0 }));
+      for (let run = 0; run < opts.runs; run++) {
+        rows.forEach((r, i) => {
+          const R = res[i];
+          const lam = (r.flow || 0) / 3600;
+          const queue = []; // время прихода машин в очереди
+          let credit = 0, maxQ = 0;
+          for (let t = 0; t < opts.duration; t++) {
+            const c = (t + (+prog.offset || 0)) % cycle;
+            // приход: число машин за секунду по Пуассону
+            let L = Math.exp(-lam), k = 0, p = 1;
+            do { k++; p *= rand(); } while (p > L);
+            for (let a = 0; a < k - 1; a++) { queue.push(t); R.arrived++; }
+            // отъезд
+            const s = r.sig[c];
+            if (r.go[c]) {
+              credit += r.lanes / opts.headway;
+              while (credit >= 1 && queue.length) {
+                const arr = queue.shift();
+                const delay = t - arr;
+                R.departed++; R.delaySum += delay; if (delay > 1) R.stopped++;
+                credit -= 1;
+              }
+              if (!queue.length) credit = Math.min(credit, 1);
+            } else credit = 0;
+            if (queue.length > maxQ) maxQ = queue.length;
+            R.queueSum += queue.length;
+            // конец зелёного с оставшейся очередью — «несработавший» цикл
+            if (s === 2 && r.sig[(c + 1) % cycle] !== 2) { R.cycles++; if (queue.length) R.overflowCycles++; }
+          }
+          R.maxQueue = Math.max(R.maxQueue, maxQ);
+          R.left = (R.left || 0) + queue.length;
+        });
+      }
+      const N = opts.runs;
+      const out = res.map((R) => ({
+        bearing: R.bearing, name: R.name, lanes: R.lanes, flow: R.flow,
+        arrived: Math.round(R.arrived / N), departed: Math.round(R.departed / N), leftInQueue: Math.round((R.left || 0) / N),
+        avgDelay: R.departed ? R.delaySum / R.departed : null,
+        stopShare: R.departed ? R.stopped / R.departed : null,
+        avgQueue: R.queueSum / (opts.duration * N), maxQueue: R.maxQueue,
+        maxQueueM: Math.round((R.maxQueue / Math.max(1, R.lanes)) * opts.carLen),
+        failedCycles: R.cycles ? R.overflowCycles / R.cycles : 0,
+      }));
+      const dep = out.reduce((s, r) => s + r.departed, 0);
+      const avgDelay = dep ? out.reduce((s, r) => s + (r.avgDelay || 0) * r.departed, 0) / dep : null;
+      return { rows: out, cycle, duration: opts.duration, runs: N, totalArrived: out.reduce((s, r) => s + r.arrived, 0), totalDeparted: dep, avgDelay, los: los(avgDelay, 0) };
+    }
+
+    /** Распределить зелёный по Вебстеру: цикл C0, зелёный фазам пропорционально критическим отношениям. */
+    websterProgram(nodeId, prog) {
+      const cap = this.tlsCapacity(nodeId, prog);
+      if (!cap || !cap.C0) return null;
+      const G = cap.C0 - cap.lost;
+      const sumY = cap.ys.reduce((a, b) => a + b, 0) || 1;
+      const p = JSON.parse(JSON.stringify(prog));
+      p.phases.forEach((ph, i) => { ph.dur = Math.max(10, Math.round((G * cap.ys[i]) / sumY) - (+ph.yellow || 0)); });
+      return p;
+    }
+
+    tlsProgram(nodeId) {
+      const n = this.nodes.get(nodeId);
+      if (!n || !n.tags["uds:tls"]) return null;
+      try { return JSON.parse(n.tags["uds:tls"]); } catch (e) { return null; }
+    }
+
+    /** Записать программу светофора на узел перекрёстка (внутри edit). null — убрать свою программу. */
+    setTlsProgram(nodeId, prog) {
+      const n = this.nodes.get(nodeId);
+      const tags = { ...n.tags };
+      if (prog) {
+        tags["uds:tls"] = JSON.stringify(prog);
+        if (tags.highway !== "traffic_signals") tags.highway = "traffic_signals";
+      } else delete tags["uds:tls"];
+      this.setTags("node", nodeId, tags);
+    }
+
+    /** Программа по умолчанию: две фазы — «ось 1» и «ось 2» (встречные подъезды вместе). */
+    defaultTlsProgram(nodeId) {
+      const appr = this.approaches(nodeId).filter((a) => a.incoming);
+      if (!appr.length) return null;
+      const axis = appr[0].bearing;
+      const onAxis = (b) => angleDiff(b, axis) < 45 || angleDiff(b, axis) > 135;
+      const g1 = appr.filter((a) => onAxis(a.bearing)), g2 = appr.filter((a) => !onAxis(a.bearing));
+      const nameOf = (g) => [...new Set(g.map((a) => a.name))].join(" / ");
+      const phases = [{ name: nameOf(g1), green: g1.map((a) => a.bearing), dur: 30, yellow: 3, red: 2 }];
+      if (g2.length) phases.push({ name: nameOf(g2), green: g2.map((a) => a.bearing), dur: 25, yellow: 3, red: 2 });
+      return { v: 1, offset: 0, approaches: this.approaches(nodeId).map((a) => ({ bearing: a.bearing, name: a.name, incoming: a.incoming })), phases };
+    }
+
+    /** Перенести светофоры с подходов на узел перекрёстка (внутри edit). */
+    moveSignalsToJunction(junctionId, signalNodes) {
+      for (const id of signalNodes) {
+        const t = { ...this.nodes.get(id).tags };
+        if (t.highway === "traffic_signals") delete t.highway;
+        delete t["traffic_signals:direction"];
+        this.setTags("node", id, t);
+      }
+      this.setTag("node", junctionId, "highway", "traffic_signals");
+      return junctionId;
+    }
+
     /** Применить автоисправление из validate(). */
     applyFix(fix) {
       if (fix.kind === "merge") return this.mergeNodes(fix.keep, fix.remove);
@@ -592,6 +1189,8 @@
       if (fix.kind === "connect") return this.connectAt(fix.wayA, fix.segA, fix.wayB, fix.segB, fix.lat, fix.lon);
       if (fix.kind === "tag") return this.setTag("way", fix.way, fix.key, fix.value);
       if (fix.kind === "unglue") return this.unglueNode(fix.node, fix.way);
+      if (fix.kind === "noexit") return this.setTag("node", fix.node, "noexit", "yes");
+      if (fix.kind === "move_signal") return this.moveSignalsToJunction(fix.junction, fix.signals);
       throw new Error("Неизвестное исправление: " + fix.kind);
     }
 
@@ -668,9 +1267,15 @@
       for (const c of comps.slice(1)) {
         const w = this.ways.get(c.ways[0]);
         const p = nodeOf(w.nodes[Math.floor(w.nodes.length / 2)]);
+        const yard = c.ways.every((id) => isYard(this.ways.get(id)));
+        if (c.ways.some((id) => this.ways.get(id).nodes.some((n) => isNoExit(nodeOf(n))))) continue;
+        const end = this.ways.get(c.ways[0]).nodes[0];
         issues.push({
-          type: "isolated", severity: "error", ways: c.ways, lat: p.lat, lon: p.lon,
-          message: `Изолированный кусок сети: ${c.ways.length} ${plural(c.ways.length, "линия", "линии", "линий")}, ${Math.round(c.length)} м — машины сюда не попадут`,
+          type: "isolated", severity: yard ? "warning" : "error", ways: c.ways, lat: p.lat, lon: p.lon,
+          fix: yard ? { kind: "noexit", node: end, label: "Это нормально" } : undefined,
+          message: `${yard ? "Изолированный двор или проезд" : "Изолированный кусок сети"}: ${c.ways.length} ${plural(c.ways.length, "линия", "линии", "линий")}, ${Math.round(c.length)} м — ` +
+            (yard ? "машины туда не попадут; если въезд есть в реальности — соедините, если нет — отметьте как норму"
+                  : "MatSim и SUMO не смогут построить сюда маршруты"),
         });
       }
 
@@ -690,12 +1295,16 @@
         const i = inDeg.get(id) || 0, o = outDeg.get(id) || 0;
         if ((i > 0 && o === 0) || (o > 0 && i === 0)) {
           if (nearBoundary(n)) continue; // край выгрузки — дорога уходит за границу фрагмента
+          if (isNoExit(n)) continue;     // отмечено как настоящий тупик
           // Тупик двусторонней дороги — нормален (разворот), ошибка только для односторонних
           const touching = this.waysOfNode(id).filter(isDrivable);
           if (!touching.some((w) => onewayDir(w) !== 0)) continue;
+          const yard = touching.every(isYard);
           issues.push({
-            type: "deadend", severity: "error", nodes: [id], ways: touching.map((w) => w.id), lat: n.lat, lon: n.lon,
-            message: o === 0 ? "Односторонний тупик: въехать можно, выехать нельзя" : "Односторонний тупик: выехать можно, въехать нельзя",
+            type: "deadend", severity: yard ? "warning" : "error", nodes: [id], ways: touching.map((w) => w.id), lat: n.lat, lon: n.lon,
+            fix: { kind: "noexit", node: id, label: "Это нормально" },
+            message: (o === 0 ? "Односторонний тупик: въехать можно, выехать нельзя" : "Односторонний тупик: выехать можно, въехать нельзя") +
+              (yard ? ". Во дворе это бывает нормой (въезд с одной улицы, выезд на другую) — если так в реальности, отметьте" : ""),
           });
         }
       }
@@ -800,7 +1409,8 @@
       }
 
       // Ловушки: участки, откуда нельзя выехать (или куда нельзя въехать) с учётом направлений.
-      // На сервере SUMO пускает 100 машин и требует, чтобы доехали все — ловушка роняет прогон.
+      // randomTrips на сервере сам отбрасывает такие поездки, прогон не падает, но участок
+      // выпадает из модели: машины в нём не ездят.
       const reportedDead = new Set(issues.filter((i) => i.type === "deadend").flatMap((i) => i.nodes));
       const isolatedWays = new Set(issues.filter((i) => i.type === "isolated").flatMap((i) => i.ways));
       for (const region of this._sccRegions(ways)) {
@@ -808,12 +1418,17 @@
         if (region.ways.every((id) => isolatedWays.has(id))) continue;
         if (region.nodes.some((id) => nearBoundary(nodeOf(id)))) continue;
         if (region.enter && region.exit) continue;
+        if (region.nodes.some((id) => isNoExit(nodeOf(id)))) continue;
         const p = nodeOf(region.nodes[Math.floor(region.nodes.length / 2)]);
+        const yard = region.ways.every((id) => isYard(this.ways.get(id)));
+        const cnt = `${region.ways.length} ${plural(region.ways.length, "линия", "линии", "линий")}`;
         issues.push({
-          type: "trap", severity: "error", ways: region.ways, nodes: region.nodes, lat: p.lat, lon: p.lon,
-          message: region.enter
-            ? `Ловушка: на этот участок (${region.ways.length} ${plural(region.ways.length, "линия", "линии", "линий")}) можно въехать, но нельзя выехать — машины в SUMO не доедут`
-            : `Ловушка: с этого участка (${region.ways.length} ${plural(region.ways.length, "линия", "линии", "линий")}) можно выехать, но въехать нельзя`,
+          type: "trap", severity: yard ? "warning" : "error", ways: region.ways, nodes: region.nodes, lat: p.lat, lon: p.lon,
+          fix: { kind: "noexit", node: region.nodes[region.nodes.length - 1], label: "Это нормально" },
+          message: (region.enter
+            ? `Ловушка: на этот участок (${cnt}) можно въехать, но нельзя выехать`
+            : `Ловушка: с этого участка (${cnt}) можно выехать, но въехать нельзя`) +
+            (yard ? " — во дворе бывает нормой; отметьте, если так в реальности" : " — проверьте направления: участок выпадает из маршрутов"),
         });
       }
 
@@ -874,6 +1489,66 @@
           type: "direction", severity: "warning", nodes: [node], ways: bad, lat: n.lat, lon: n.lon,
           message: `Неверное направление: части улицы «${k.split("|")[1]}» односторонние навстречу друг другу`,
         });
+      }
+
+      // Светофоры на подходах: SUMO сделает отдельный светофор посреди дороги,
+      // а сам перекрёсток останется нерегулируемым.
+      const jDeg = (id) => this.waysOfNode(id).filter(isDrivable).length;
+      const isJunction = (id) => {
+        const ws = this.waysOfNode(id).filter(isDrivable);
+        if (ws.length >= 2) return true;
+        return ws.some((w) => { const i = w.nodes.indexOf(id); return i > 0 && i < w.nodes.length - 1 && w.nodes.indexOf(id, i + 1) > 0; });
+      };
+      const approachSignals = new Map(); // перекрёсток -> узлы-светофоры на подходах
+      for (const n of this.nodes.values()) {
+        if (n.tags.highway !== "traffic_signals" || n.tags.crossing) continue;
+        if (isJunction(n.id) || jDeg(n.id) === 0) continue;
+        // ближайший перекрёсток вдоль дороги в пределах 40 м
+        let best = null;
+        for (const w of this.waysOfNode(n.id).filter(isDrivable)) {
+          const i = w.nodes.indexOf(n.id);
+          for (const step of [-1, 1]) {
+            let dist = 0;
+            for (let k = i + step; k >= 0 && k < w.nodes.length; k += step) {
+              dist += distM(nodeOf(w.nodes[k - step]), nodeOf(w.nodes[k]));
+              if (dist > 40) break;
+              if (isJunction(w.nodes[k])) { if (!best || dist < best.dist) best = { id: w.nodes[k], dist }; break; }
+            }
+          }
+        }
+        if (!best || nodeOf(best.id).tags.highway === "traffic_signals") continue;
+        if (!approachSignals.has(best.id)) approachSignals.set(best.id, []);
+        approachSignals.get(best.id).push(n.id);
+      }
+      for (const [jid, sigs] of approachSignals) {
+        const j = nodeOf(jid);
+        issues.push({
+          type: "signal_approach", severity: "warning", nodes: [jid, ...sigs], lat: j.lat, lon: j.lon,
+          fix: { kind: "move_signal", junction: jid, signals: sigs, label: "Перенести на перекрёсток" },
+          message: `Светофор стоит на подходе к перекрёстку (${sigs.length} ${plural(sigs.length, "точка", "точки", "точек")}): SUMO сделает отдельный светофор посреди дороги, а перекрёсток останется нерегулируемым`,
+        });
+      }
+
+      // Программы светофоров: каждый подъезд должен где-то получать зелёный
+      for (const n of this.nodes.values()) {
+        if (!n.tags["uds:tls"]) continue;
+        const prog = this.tlsProgram(n.id);
+        if (!prog) {
+          issues.push({ type: "tls", severity: "error", nodes: [n.id], lat: n.lat, lon: n.lon, message: "Программа светофора повреждена — откройте узел и задайте заново" });
+          continue;
+        }
+        const now = this.approaches(n.id).filter((a) => a.incoming);
+        const greens = new Set(prog.phases.flatMap((p) => p.green));
+        const lost = now.filter((a) => ![...greens].some((g) => angleDiff(g, a.bearing) <= 25));
+        if (lost.length) {
+          issues.push({
+            type: "tls", severity: "error", nodes: [n.id], lat: n.lat, lon: n.lon,
+            message: `Программа светофора: подъезд ${lost.map((a) => `«${a.name}» (${a.bearing}°)`).join(", ")} ни в одной фазе не получает зелёный — машины там встанут`,
+          });
+        }
+        if (!isJunction(n.id)) {
+          issues.push({ type: "tls", severity: "warning", nodes: [n.id], lat: n.lat, lon: n.lon, message: "Программа светофора задана не на перекрёстке" });
+        }
       }
 
       const order = { error: 0, warning: 1 };
@@ -972,6 +1647,26 @@
      * Автозаполнение пропусков. defaults: { highway: { lanes, oneLanes, maxspeed } }.
      * Возвращает список предлагаемых изменений [{way, key, value, label}] — ничего не меняет.
      */
+    /**
+     * Чего не хватает у дорог для машин: полосы, скорость, ширина, покрытие, название.
+     * Возвращает {field: [wayId…]} и общее число дорог.
+     */
+    missingData() {
+      const fields = { lanes: [], maxspeed: [], width: [], surface: [], name: [] };
+      let total = 0;
+      for (const w of this.ways.values()) {
+        if (!isDrivable(w)) continue;
+        total++;
+        const t = w.tags;
+        if (!t.lanes && !t["lanes:forward"] && !t["lanes:backward"]) fields.lanes.push(w.id);
+        if (!t.maxspeed) fields.maxspeed.push(w.id);
+        if (!t.width) fields.width.push(w.id);
+        if (!t.surface) fields.surface.push(w.id);
+        if (!t.name && !["service", "living_street"].includes(t.highway) && !(t.highway || "").endsWith("_link")) fields.name.push(w.id);
+      }
+      return { fields, total };
+    }
+
     autofillPlan(defaults, keys) {
       keys = keys || ["lanes", "maxspeed"];
       const plan = [];
@@ -987,12 +1682,39 @@
         if (keys.includes("maxspeed") && !w.tags.maxspeed && d.maxspeed) {
           plan.push({ way: w.id, key: "maxspeed", value: String(d.maxspeed), label: label(w) });
         }
+        // ширина проезжей части = число полос × ширина полосы по нормам
+        if (keys.includes("width") && !w.tags.width && d.laneWidth) {
+          const l = this.lanesOf(w);
+          const n = l.total || (one ? d.oneLanes : d.lanes) || 1;
+          plan.push({ way: w.id, key: "width", value: String(Math.round(n * d.laneWidth * 10) / 10), label: label(w) });
+        }
+        if (keys.includes("surface") && !w.tags.surface && d.surface) {
+          plan.push({ way: w.id, key: "surface", value: d.surface, label: label(w) });
+        }
+        if (keys.includes("turns")) {
+          for (const side of one ? ["forward"] : ["forward", "backward"]) {
+            const cur = this.turnLanes(w, side);
+            if (!cur.length || cur.some(Boolean)) continue;
+            const end = (one ? onewayDir(w) > 0 : side === "forward") ? w.nodes[w.nodes.length - 1] : w.nodes[0];
+            if (this.waysOfNode(end).filter(isDrivable).length < 2) continue;
+            const def = this.defaultTurnLanes(w, side);
+            if (def.some(Boolean)) plan.push({ way: w.id, key: "turns", side, value: def, label: label(w) });
+          }
+        }
       }
       return plan;
     }
 
     applyAutofill(plan) {
+      // сначала полосы — от них зависят ширина и стрелки
+      plan = [...plan].sort((a, b) => (a.key === "lanes" ? 0 : a.key === "turns" ? 2 : 1) - (b.key === "lanes" ? 0 : b.key === "turns" ? 2 : 1));
       for (const p of plan) {
+        if (p.key === "turns") {
+          const w = this.ways.get(p.way);
+          const def = this.defaultTurnLanes(w, p.side);
+          if (def.some(Boolean)) this.setTurnLanes(p.way, p.side, def);
+          continue;
+        }
         if (p.key === "lanes") {
           const w = this.ways.get(p.way);
           const n = parseInt(p.value, 10);
@@ -1131,5 +1853,5 @@
     return many;
   }
 
-  return { OsmDoc, DRIVABLE, isDrivable, onewayDir, distM, projector, label, plural };
+  return { OsmDoc, DRIVABLE, isDrivable, onewayDir, distM, projector, label, plural, bearing, angleDiff, isYard, turnClass, taperProfile, densify };
 });

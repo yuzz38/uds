@@ -3,7 +3,8 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const { DOMParser } = require("@xmldom/xmldom");
-const { OsmDoc, isDrivable } = require("../js/osm.js");
+const OSMlib = require("../js/osm.js");
+const { OsmDoc, isDrivable, angleDiff } = OSMlib;
 
 const P = DOMParser;
 let passed = 0;
@@ -421,6 +422,241 @@ test("пешеходы: example.osm считается быстро и повт�
   assert.ok(r.stats.routed > 300);
   assert.deepStrictEqual(r.crossings.map((c) => c.node), r2.crossings.map((c) => c.node));
   assert.ok(ms < 5000);
+});
+
+
+// ---------- дворы, светофоры ----------
+
+test("тупик во дворе — предупреждение, noexit=yes убирает его", () => {
+  const d = load(GRID(`<node id="30" lat="52.0045" lon="104.0015"/>
+    <way id="31"><nd ref="5"/><nd ref="30"/><tag k="highway" v="service"/><tag k="oneway" v="yes"/></way>`));
+  const dead = d.validate().find((i) => i.type === "deadend" || i.type === "trap");
+  assert.ok(dead, "односторонний въезд во двор найден");
+  assert.strictEqual(dead.severity, "warning", "во дворе — не ошибка, а предупреждение");
+  d.edit("норма", () => d.applyFix(dead.fix));
+  assert.strictEqual(d.nodes.get(dead.fix.node).tags.noexit, "yes");
+  assert.ok(!d.validate().some((i) => i.type === "deadend" || i.type === "trap"));
+});
+
+test("односторонний тупик на улице — по-прежнему ошибка", () => {
+  const d = load(GRID(`<node id="30" lat="52.0045" lon="104.0015"/>
+    <way id="31"><nd ref="5"/><nd ref="30"/><tag k="highway" v="residential"/><tag k="oneway" v="yes"/></way>`));
+  const dead = d.validate().find((i) => i.type === "deadend");
+  assert.strictEqual(dead.severity, "error");
+});
+
+test("изолированный двор — предупреждение", () => {
+  const d = load(GRID(`<node id="40" lat="52.010" lon="104.010"/><node id="41" lat="52.011" lon="104.010"/>
+    <way id="42"><nd ref="40"/><nd ref="41"/><tag k="highway" v="service"/></way>`));
+  const iso = d.validate().find((i) => i.type === "isolated");
+  assert.strictEqual(iso.severity, "warning");
+});
+
+test("подъезды к перекрёстку и программа по умолчанию", () => {
+  const d = load(GRID(""));
+  // узел 4: улица 11 на восток и улица 12 на юг — Т-образный
+  const a = d.approaches("4");
+  assert.deepStrictEqual(a.map((x) => x.bearing).sort((x, y) => x - y), [90, 180]);
+  assert.ok(a.every((x) => x.incoming));
+  const p = d.defaultTlsProgram("4");
+  assert.strictEqual(p.phases.length, 2);
+  d.edit("tls", () => d.setTlsProgram("4", p));
+  assert.strictEqual(d.nodes.get("4").tags.highway, "traffic_signals");
+  assert.deepStrictEqual(d.tlsProgram("4").phases.map((x) => x.green.length), [1, 1]);
+  assert.ok(!d.validate().some((i) => i.type === "tls"));
+  // фазу удалили — один подъезд никогда не получает зелёный
+  d.edit("tls", () => d.setTlsProgram("4", Object.assign(p, { phases: [p.phases[0]] })));
+  assert.ok(d.validate().some((i) => i.type === "tls" && i.severity === "error"));
+});
+
+test("светофор на подходе — перенос на перекрёсток", () => {
+  const d = load(GRID(`<node id="50" lat="52.003" lon="104.0028"><tag k="highway" v="traffic_signals"/></node>`)
+    .replace('<nd ref="4"/><nd ref="5"/><nd ref="6"/>', '<nd ref="4"/><nd ref="50"/><nd ref="5"/><nd ref="6"/>')
+    .replace("</osm>", '<node id="60" lat="52.006" lon="104.0035"/><way id="61"><nd ref="5"/><nd ref="60"/><tag k="highway" v="residential"/></way></osm>'));
+  const sig = d.validate().find((i) => i.type === "signal_approach");
+  assert.ok(sig, "светофор на подходе найден");
+  assert.strictEqual(sig.fix.junction, "5");
+  d.edit("перенос", () => d.applyFix(sig.fix));
+  assert.strictEqual(d.nodes.get("5").tags.highway, "traffic_signals");
+  assert.ok(!d.nodes.get("50").tags.highway);
+  assert.ok(!d.validate().some((i) => i.type === "signal_approach"));
+});
+
+
+// ---------- полосы со стрелками, манёвры, расчёт перекрёстка ----------
+
+test("стрелки на полосах: чтение и запись", () => {
+  const d = load(GRID(""));
+  d.edit("полосы", () => d.setLanes("10", 2, 1));
+  d.edit("стрелки", () => d.setTurnLanes("10", "forward", ["left", "through;right"]));
+  assert.strictEqual(d.ways.get("10").tags["turn:lanes:forward"], "left|through;right");
+  assert.deepStrictEqual(d.turnLanes(d.ways.get("10"), "forward"), ["left", "through;right"]);
+  assert.deepStrictEqual(d.turnLanes(d.ways.get("10"), "backward"), [""]);
+  d.edit("убрать", () => d.setTurnLanes("10", "forward", ["", ""]));
+  assert.ok(!("turn:lanes:forward" in d.ways.get("10").tags));
+});
+
+test("манёвры на перекрёстке и запрет по стрелкам", () => {
+  const d = load(GRID(`<node id="60" lat="52.006" lon="104.003"/><way id="61"><nd ref="5"/><nd ref="60"/><tag k="highway" v="residential"/></way>
+    <node id="62" lat="52.000" lon="104.003"/><way id="63"><nd ref="62"/><nd ref="5"/><tag k="highway" v="residential"/></way>`));
+  // узел 5 — крестовина: подъезды с З (4), В (6), С (60), Ю (62)
+  const m = d.movements("5");
+  const fromSouth = m.filter((x) => angleDiff(x.from.bearing, 180) < 10);
+  const types = Object.fromEntries(fromSouth.map((x) => [x.type, x.allowed]));
+  assert.deepStrictEqual(Object.keys(types).sort(), ["left", "reverse", "right", "through"]);
+  assert.strictEqual(types.reverse, false, "разворот без стрелки запрещён");
+  // на подъезде с юга одна полоса «только прямо»
+  d.edit("стрелки", () => { d.setTag("way", "63", "lanes", "2"); d.setLanes("63", 1, 1); d.setTurnLanes("63", "forward", ["through"]); });
+  const t2 = Object.fromEntries(d.movements("5").filter((x) => angleDiff(x.from.bearing, 180) < 10).map((x) => [x.type, x.allowed]));
+  assert.deepStrictEqual([t2.through, t2.left, t2.right], [true, false, false]);
+});
+
+test("расчёт по Вебстеру: пропускная способность, задержка, очередь, оптимальный цикл", () => {
+  const d = load(GRID(""));
+  const p = d.defaultTlsProgram("4");
+  p.phases.forEach((ph) => { ph.dur = 27; ph.yellow = 3; ph.red = 0; });
+  p.flows = { "90": 500, "180": 300 };
+  d.edit("tls", () => d.setTlsProgram("4", p));
+  const c = d.tlsCapacity("4");
+  assert.strictEqual(c.cycle, 60);
+  const east = c.rows.find((r) => r.bearing === 90);
+  assert.strictEqual(east.green, 30);
+  assert.strictEqual(east.capacity, 900, "1800 × 30/60");
+  assert.ok(Math.abs(east.x - 500 / 900) < 1e-9);
+  assert.ok(east.delay > 5 && east.delay < 40, "задержка правдоподобна: " + east.delay);
+  assert.ok(east.queue.veh >= 4 && east.queue.m > 20);
+  assert.ok(c.C0 >= 30 && c.C0 <= 150);
+  const w = d.websterProgram("4", p);
+  assert.ok(w.phases[0].dur > w.phases[1].dur, "больше зелёного — более загруженному подъезду");
+  // перегруз
+  p.flows = { "90": 1200, "180": 300 };
+  const c2 = d.tlsCapacity("4", p);
+  assert.strictEqual(c2.rows.find((r) => r.bearing === 90).los, "F");
+});
+
+
+test("знаки приоритета по данным: второстепенным — «Уступите», главной — «Главная»", () => {
+  const d = load(GRID(`<node id="60" lat="52.006" lon="104.003"/><way id="61"><nd ref="5"/><nd ref="60"/><tag k="highway" v="residential"/></way>`));
+  // узел 5: улица 11 (secondary) насквозь + residential 61 на север — Т-образный
+  assert.deepStrictEqual(d.suggestSigns().filter((x) => x.junction === "5").map((x) => x.kind), ["give_way"]);
+  const sg = d.suggestSigns({ main: true }).filter((x) => x.junction === "5");
+  assert.deepStrictEqual(sg.map((x) => x.kind).sort(), ["give_way", "main", "main"]);
+  const n = d.edit("знаки", () => d.placeSigns(sg));
+  assert.strictEqual(n, 3);
+  const gw = [...d.nodes.values()].find((x) => x.tags.highway === "give_way");
+  assert.ok(gw && d.waysOfNode(gw.id)[0].id === "61");
+  assert.ok(Math.abs(OSMlib.distM(gw, d.nodes.get("5")) - 12) < 1);
+  assert.strictEqual(d.suggestSigns({ main: true }).filter((x) => x.junction === "5").length, 0, "повторно не предлагает");
+});
+
+
+test("стык 3 полосы → 2: края сходятся, ширина меняется плавно", () => {
+  const d = load(`<osm version="0.6">
+   <node id="1" lat="52.000" lon="104.000"/><node id="2" lat="52.000" lon="104.001"/><node id="3" lat="52.000" lon="104.002"/>
+   <way id="10"><nd ref="1"/><nd ref="2"/><tag k="highway" v="primary"/><tag k="oneway" v="yes"/><tag k="lanes" v="3"/></way>
+   <way id="11"><nd ref="3"/><nd ref="2"/><tag k="highway" v="primary"/><tag k="oneway" v="-1"/><tag k="lanes" v="2"/></way></osm>`);
+  const a = d.ways.get("10"), b = d.ways.get("11");
+  const ea = d.endProfile(a, true), eb = d.endProfile(b, true); // у обеих стык — в конце линии
+  assert.ok(ea && eb, "продолжение найдено, хоть вторая линия нарисована навстречу");
+  const own = d.crossSection(a), ownB = d.crossSection(b);
+  const pa = OSMlib.taperProfile(70, 0, own, null, ea, 25), pb = OSMlib.taperProfile(70, 0, ownB, null, eb, 25);
+  // на стыке обе линии одинаковой ширины: края совпадают (у второй лево и право меняются местами)
+  assert.ok(Math.abs(pa.left - pa.right - (pb.left - pb.right)) < 1e-9);
+  assert.ok(Math.abs(pa.left + pb.right) < 1e-9 && Math.abs(pa.right + pb.left) < 1e-9);
+  // за 25 м от стыка — своя ширина
+  const far = OSMlib.taperProfile(0, 30, own, null, ea, 25);
+  assert.ok(Math.abs(far.left - far.right - 9.6) < 1e-9);
+});
+
+
+test("улица расходится на две проезжие части: каждая выходит из своей половины", () => {
+  const d = load(`<osm version="0.6">
+   <node id="1" lat="52.000" lon="104.000"/><node id="2" lat="52.000" lon="104.001"/>
+   <node id="3" lat="52.0001" lon="104.002"/><node id="4" lat="51.9999" lon="104.002"/>
+   <way id="10"><nd ref="1"/><nd ref="2"/><tag k="highway" v="primary"/><tag k="name" v="Лермонтова"/><tag k="lanes" v="4"/></way>
+   <way id="11"><nd ref="3"/><nd ref="2"/><tag k="highway" v="primary"/><tag k="name" v="Лермонтова"/><tag k="oneway" v="yes"/><tag k="lanes" v="2"/></way>
+   <way id="12"><nd ref="2"/><nd ref="4"/><tag k="highway" v="primary"/><tag k="name" v="Лермонтова"/><tag k="oneway" v="yes"/><tag k="lanes" v="2"/></way></osm>`);
+  assert.strictEqual(d.endProfile(d.ways.get("10"), true), null, "двусторонняя улица остаётся во всю ширину");
+  const out = d.endProfile(d.ways.get("12"), false);  // по ходу движения улицы 10 — правая половина
+  assert.ok(out && out.exact);
+  assert.ok(Math.abs(out.left - 0) < 1e-9 && Math.abs(out.right + 6.4) < 1e-9, JSON.stringify(out));
+  const inn = d.endProfile(d.ways.get("11"), true);
+  assert.ok(inn && inn.exact && Math.abs(inn.left - 0) < 1e-9 && Math.abs(inn.right + 6.4) < 1e-9, JSON.stringify(inn));
+});
+
+
+// ---------- запреты, ОТ, стрелки по умолчанию, неполные данные, симуляция, доступность ----------
+
+const CROSS = GRID(`<node id="60" lat="52.006" lon="104.003"/><way id="61"><nd ref="5"/><nd ref="60"/><tag k="highway" v="residential"/></way>
+  <node id="62" lat="52.000" lon="104.003"/><way id="63"><nd ref="62"/><nd ref="5"/><tag k="highway" v="residential"/></way>`);
+
+test("запрет манёвра из файла учитывается в манёврах", () => {
+  const d = load(CROSS.replace("</osm>", `<relation id="90"><member type="way" ref="63" role="from"/><member type="node" ref="5" role="via"/>
+    <member type="way" ref="11" role="to"/><tag k="type" v="restriction"/><tag k="restriction" v="no_left_turn"/></relation></osm>`));
+  const m = d.movements("5").filter((x) => angleDiff(x.from.bearing, 180) < 10);
+  const left = m.find((x) => x.type === "left");
+  assert.strictEqual(left.allowed, false);
+  assert.strictEqual(left.restriction.kind, "no_left_turn");
+  assert.ok(m.find((x) => x.type === "through").allowed);
+  assert.strictEqual(d.restrictions().length, 1);
+});
+
+test("example.osm: маршруты и остановки ОТ из файла", () => {
+  const d = load(fs.readFileSync(path.join(__dirname, "..", "example.osm"), "utf8"));
+  const r = d.transitRoutes();
+  assert.ok(r.filter((x) => x.mode === "bus").length >= 40);
+  assert.ok(r.some((x) => x.mode === "tram") && r.some((x) => x.mode === "trolleybus"));
+  assert.ok(d.transitStops().length >= 15);
+  assert.ok(d.restrictions().length >= 20);
+});
+
+test("стрелки по умолчанию: левая — налево и прямо, правая — прямо и направо", () => {
+  const d = load(CROSS);
+  d.edit("полосы", () => d.setLanes("63", 2, 1));
+  assert.deepStrictEqual(d.defaultTurnLanes(d.ways.get("63"), "forward"), ["left;through", "through;right"]);
+  d.edit("полосы", () => d.setLanes("63", 3, 1));
+  assert.deepStrictEqual(d.defaultTurnLanes(d.ways.get("63"), "forward"), ["left", "through", "through;right"]);
+});
+
+test("неполные данные и заполнение по нормам", () => {
+  const d = load(GRID(""));
+  const m = d.missingData();
+  assert.strictEqual(m.total, 4);
+  assert.strictEqual(m.fields.width.length, 4);
+  const plan = d.autofillPlan({ secondary: { lanes: 2, oneLanes: 2, maxspeed: 60, laneWidth: 3.5, surface: "asphalt" },
+    residential: { lanes: 2, oneLanes: 1, maxspeed: 40, laneWidth: 3.0, surface: "asphalt" } }, ["lanes", "maxspeed", "width", "surface"]);
+  d.edit("нормы", () => d.applyAutofill(plan));
+  assert.strictEqual(d.ways.get("10").tags.width, "7");
+  assert.strictEqual(d.ways.get("12").tags.width, "6");
+  assert.strictEqual(d.missingData().fields.width.length, 0);
+});
+
+test("симуляция перекрёстка: недогруз — все уехали, перегруз — очередь растёт", () => {
+  const d = load(GRID(""));
+  const p = d.defaultTlsProgram("4");
+  p.phases.forEach((ph) => { ph.dur = 27; ph.yellow = 3; ph.red = 0; });
+  p.flows = { "90": 400, "180": 300 };
+  const sim = d.simulateJunction("4", p, { runs: 3 });
+  const east = sim.rows.find((r) => r.bearing === 90);
+  assert.ok(Math.abs(east.arrived - 400) < 80, "пришло около 400: " + east.arrived);
+  assert.ok(east.leftInQueue < 15);
+  assert.ok(east.avgDelay > 3 && east.avgDelay < 40, "задержка: " + east.avgDelay);
+  assert.ok(east.maxQueueM > 0);
+  p.flows = { "90": 1500, "180": 300 };
+  const over = d.simulateJunction("4", p, { runs: 2 }).rows.find((r) => r.bearing === 90);
+  assert.ok(over.leftInQueue > 100, "перегруз: осталось " + over.leftInQueue);
+  assert.ok(over.failedCycles > 0.9);
+});
+
+test("пешеходная доступность остановок", () => {
+  const d = load(fs.readFileSync(path.join(__dirname, "..", "example.osm"), "utf8"));
+  const stops = d.transitStops();
+  const a = Ped.accessibility(d, stops, { minutes: 5 });
+  assert.ok(a.edges.length > 50);
+  assert.ok(a.covered > 0 && a.covered <= a.buildings);
+  const fewer = Ped.accessibility(d, stops.slice(0, 2), { minutes: 5 });
+  assert.ok(fewer.covered < a.covered, "меньше остановок — меньше охват");
+  console.log(`     доступность: ${a.covered} из ${a.buildings} зданий в 5 минутах от остановки`);
 });
 
 console.log(`\n${passed} тестов пройдено`);

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ГрафУДС — редактор дорожного графа</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛣️</text></svg>">
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="toolbar">
+  <div class="brand" title="Редактор графа улично-дорожной сети"><span class="logo" aria-hidden="true"></span>Граф<b>УДС</b></div>
+
+  <div class="group modes" role="group" aria-label="Режим">
+    <button data-mode="select" class="active" title="Выбор и правка (V)">Выбор <kbd>V</kbd></button>
+    <button data-mode="draw" title="Нарисовать дорогу (N)">Дорога <kbd>N</kbd></button>
+    <button data-mode="signal" title="Поставить или убрать светофор (T)">Светофор <kbd>T</kbd></button>
+    <button data-mode="sign" title="Дорожный знак (S)">Знак <kbd>S</kbd></button>
+    <button data-mode="crossing" title="Пешеходный переход (P)">Переход <kbd>P</kbd></button>
+    <button data-mode="measure" title="Линейка (M)">Линейка <kbd>M</kbd></button>
+  </div>
+
+  <button id="btn-menu" class="menu-btn" aria-expanded="false" aria-controls="toolbar-more" title="Меню">☰</button>
+
+  <div class="group mode-options" id="tpl-group">
+    <select id="template" title="Шаблон для новой дороги"></select>
+    <button id="btn-apply-tpl" title="Применить шаблон к выбранной дороге">К выбранной</button>
+  </div>
+  <div class="group mode-options">
+    <select id="sign-type" title="Какой знак ставить" hidden></select>
+    <select id="crossing-type" title="Какой переход ставить" hidden></select>
+  </div>
+
+  <div class="toolbar-more" id="toolbar-more">
+    <div class="group file-group">
+      <button id="btn-open" title="Открыть .osm (Ctrl+O)">Открыть</button>
+      <button id="btn-example" title="Открыть example.osm, лежащий рядом с редактором">Пример</button>
+      <input id="file-input" type="file" accept=".osm,.xml" hidden>
+      <input id="patch-input" type="file" accept=".json" hidden>
+      <label class="team" title="Имя файла при сохранении = имя команды">
+        <input id="team-name" value="team1" spellcheck="false" size="8"><span>.osm</span>
+      </label>
+      <button id="btn-save" class="primary" title="Сохранить .osm (Ctrl+S)">Сохранить</button>
+    </div>
+    <div class="group">
+      <button id="btn-3d" title="3D-просмотр видимой области (3)">3D <kbd>3</kbd></button>
+      <button id="btn-traj" title="Траектории манёвров и конфликтные точки на перекрёстках (J)">Траектории <kbd>J</kbd></button>
+      <button id="btn-qr" title="QR-код ссылки на редактор с этой картой">QR</button>
+    </div>
+    <div class="group">
+      <button id="btn-undo" title="Отменить (Ctrl+Z)" disabled>↶</button>
+      <button id="btn-redo" title="Повторить (Ctrl+Y)" disabled>↷</button>
+    </div>
+    <div class="group grow">
+      <input id="search" type="search" placeholder="Найти улицу…" list="street-names" spellcheck="false">
+      <datalist id="street-names"></datalist>
+      <datalist id="speeds"><option value="20"><option value="40"><option value="50"><option value="60"><option value="70"><option value="80"><option value="RU:urban"><option value="RU:living_street"></datalist>
+    </div>
+    <div class="group">
+      <label class="tool-label" title="Чем раскрашивать дороги">Раскраска
+        <select id="view-mode"></select>
+      </label>
+    </div>
+    <div class="group">
+      <label class="tool-label opacity" title="Прозрачность подложки">Подложка
+        <input id="base-opacity" type="range" min="0" max="100" value="70">
+      </label>
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+  <div class="map-wrap">
+    <div id="map" aria-label="Карта"></div>
+    <div id="view3d" class="view3d" hidden>
+      <div class="view3d-bar">
+        <b>3D — проверка уровней</b>
+        <span id="view3d-info" class="small"></span>
+        <label class="small">Радиус
+          <select id="view3d-radius"><option value="150">150 м</option><option value="250" selected>250 м</option><option value="400">400 м</option></select>
+        </label>
+        <label class="small"><input type="checkbox" id="view3d-buildings"> здания</label>
+        <button id="view3d-here" title="Перестроить вокруг выбранного на карте">Вокруг выбранного</button>
+        <button id="view3d-top" title="Вид сверху">Сверху</button>
+        <button id="view3d-reset" title="Вернуть вид">Сбросить вид</button>
+        <button id="view3d-close" class="primary" title="Вернуться к карте (Esc)">✕ К карте</button>
+      </div>
+      <div class="view3d-legend small">
+        <span><i style="background:#454b52"></i>мост: +5 м на уровень</span>
+        <span><i style="background:#2b2f34"></i>тоннель / выемка: −5 м</span>
+        <span><i style="background:#e64980"></i>пешеходный мост</span>
+        <span><i style="background:#9c36b5"></i>подземный переход</span>
+        <span><i style="background:#e03131"></i>проблема</span>
+        <span class="muted">Пандусы 100 м — как в Webots на сервере. Клик по дороге — выбрать и править справа, 3D обновится само. Земля полупрозрачная — тоннели видны сквозь неё.</span>
+      </div>
+      <div id="view3d-canvas" class="view3d-canvas"></div>
+    </div>
+  </div>
+  <aside class="sidebar" id="sidebar">
+    <button id="sheet-handle" class="sheet-handle" aria-label="Развернуть или свернуть панель"><span></span></button>
+    <nav class="tabs" role="tablist">
+      <button data-tab="object" class="active" role="tab">Объект</button>
+      <button data-tab="issues" role="tab">Проблемы <span id="issues-count" class="badge"></span></button>
+      <button data-tab="ped" role="tab">Пешеходы</button>
+      <button data-tab="ot" role="tab">ОТ</button>
+      <button data-tab="changes" role="tab">Правки</button>
+      <button data-tab="help" role="tab" title="Справка">?</button>
+    </nav>
+    <section id="tab-object" class="tab active"></section>
+    <section id="tab-issues" class="tab"></section>
+    <section id="tab-ped" class="tab"></section>
+    <section id="tab-ot" class="tab"></section>
+    <section id="tab-changes" class="tab"></section>
+    <section id="tab-help" class="tab"></section>
+  </aside>
+</main>
+
+<footer class="statusbar">
+  <span id="status-mode"></span>
+  <span id="status-file"></span>
+  <span id="status-stats"></span>
+  <span id="status-saved"></span>
+  <span id="status-coords"></span>
+</footer>
+
+<div id="drop-hint" class="drop-hint" hidden>Отпустите файл .osm, чтобы открыть</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<div id="qr-dialog" class="qr-dialog" hidden>
+  <div class="qr-box">
+    <h2>Откройте редактор с телефона</h2>
+    <div id="qr-image" class="qr-image"></div>
+    <p class="small"><a id="qr-url" target="_blank" rel="noopener"></a></p>
+    <div class="actions" style="justify-content:center">
+      <button id="qr-copy">Скопировать ссылку</button>
+      <button id="qr-close" class="primary">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="vendor/qrcode/qrcode.js"></script>
+<script src="vendor/three/three.min.js"></script>
+<script src="vendor/three/OrbitControls.js"></script>
+<script src="js/osm.js"></script>
+<script src="js/pedestrians.js"></script>
+<script src="js/view3d.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

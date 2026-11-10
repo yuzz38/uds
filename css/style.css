@@ -263,3 +263,56 @@ details summary { cursor: pointer; color: var(--muted); margin: 4px 0; }
   .vtx { transform: scale(1.4); }
   .vtx-mid { transform: scale(1.3); }
 }
+
+/* ---------- светофорный объект ---------- */
+.tls-top { display: grid; grid-template-columns: 150px 1fr; gap: 10px; align-items: center; }
+.tls-diagram { width: 150px; height: 150px; }
+.phase { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin-top: 8px; cursor: pointer; }
+.phase.sel { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
+.phase-head { display: grid; grid-template-columns: 18px 1fr auto auto auto; gap: 4px; align-items: center; }
+.phase-head input { min-width: 0; }
+.phase-head button { padding: 2px 8px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+.chip { font-size: 12px; padding: 3px 8px; border-radius: 12px; background: var(--bg); }
+.chip.on { background: #2f9e44; border-color: #2f9e44; color: #fff; }
+.phase-times { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.phase-times label { display: grid; gap: 2px; font-size: 12px; color: var(--muted); }
+.phase-times input { width: 100%; }
+.tls-chart { width: 100%; height: auto; display: block; background: var(--bg); border-radius: 6px; }
+@media (max-width: 760px) { .tls-top { grid-template-columns: 120px 1fr; } .tls-diagram { width: 120px; height: 120px; } }
+
+/* ---------- объяснение проблемы на карте ---------- */
+.issue-pop p { margin: 0 0 6px; font-size: 13px; line-height: 1.4; }
+.issue-pop-type { font-weight: 700; }
+.issue-pop-type.error { color: #c92a2a; }
+.issue-pop-type.warning { color: #b26b00; }
+.issue-pop .actions { margin-top: 8px; }
+.leaflet-popup-content-wrapper { border-radius: 10px; }
+
+/* ---------- полосы, стрелки, траектории ---------- */
+.turn-row { display: flex; gap: 4px; flex-wrap: wrap; }
+.turn-row select { flex: 1 1 70px; min-width: 70px; font-size: 13px; padding: 2px 4px; }
+.lane-unknown { width: 16px; height: 16px; border-radius: 50%; background: #e03131; color: #fff; font: 700 11px/16px system-ui; text-align: center; }
+button.active-toggle { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+
+.flow-grid { display: grid; grid-template-columns: 1fr 90px; gap: 4px 8px; align-items: center; font-size: 13px; }
+.calc { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.calc th { text-align: left; color: var(--muted); font-weight: 600; padding: 3px 4px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.calc td { padding: 3px 4px; border-bottom: 1px solid var(--line); }
+.calc tr.warn td { background: color-mix(in srgb, #f59f00 15%, transparent); }
+.calc tr.over td { background: color-mix(in srgb, #e03131 18%, transparent); }
+
+/* ---------- ОТ, неполные данные, клавиши, выделенная проблема ---------- */
+.route-row { display: grid; grid-template-columns: 18px 44px 1fr; gap: 6px; align-items: center; padding: 2px 0; }
+.missing-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; font-size: 13px; }
+.missing-row button { padding: 2px 8px; }
+.keys { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; align-items: center; font-size: 13px; }
+.key-btn { min-width: 64px; font: 12px ui-monospace, Consolas, monospace; }
+.issue.active { outline: 2px solid var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent); }
+
+/* зона доступности — только картинка, клики проходят к дорогам */
+.leaflet-accessPane-pane, .leaflet-accessPane-pane canvas { pointer-events: none !important; }
+.leaflet-issuesPane-pane svg { pointer-events: none; }
+.leaflet-issuesPane-pane svg path.leaflet-interactive { pointer-events: visiblePainted; }
+.leaflet-pointsPane-pane svg { pointer-events: none; }
+.leaflet-pointsPane-pane svg path.leaflet-interactive { pointer-events: visiblePainted; cursor: pointer; }

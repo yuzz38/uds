@@ -111,7 +111,7 @@
       let mx = n1.x + n2.x, mz = n1.z + n2.z;
       const ml = Math.hypot(mx, mz) || 1;
       mx /= ml; mz /= ml;
-      const k = Math.min(1 / Math.max(mx * n1.x + mz * n1.z, 0.35), 2.5);
+      const k = Math.min(1 / Math.max(mx * n1.x + mz * n1.z, 0.35), 1.6);
       out.push({ x: mx * k, z: mz * k });
     }
     return out;
@@ -120,6 +120,8 @@
   const lerp = (p, q, t) => ({ x: p.x + (q.x - p.x) * t, z: p.z + (q.z - p.z) * t, y: p.y + (q.y - p.y) * t });
   const lerpM = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t });
   const at = (p, m, off, lift) => [p.x + m.x * off, p.y + lift, p.z + m.z * off];
+  const ov = (off, i) => (Array.isArray(off) ? off[i] : off);
+  const lerpOff = (off, i, j, t) => ov(off, i) + (ov(off, j) - ov(off, i)) * t;
 
   class Builder {
     constructor() { this.pos = []; this.col = []; this.owner = []; }
@@ -146,7 +148,7 @@
         const p = pts[i - 1], q = pts[i], m1 = mit[i - 1], m2 = mit[i];
         const len = Math.hypot(q.x - p.x, q.z - p.z);
         if (!dash) {
-          this.quad(at(p, m1, off1, lift), at(p, m1, off2, lift), at(q, m2, off2, lift), at(q, m2, off1, lift), color, owner);
+          this.quad(at(p, m1, ov(off1, i - 1), lift), at(p, m1, ov(off2, i - 1), lift), at(q, m2, ov(off2, i), lift), at(q, m2, ov(off1, i), lift), color, owner);
           continue;
         }
         // прерывистая: штрих 3 м, промежуток 6 м
@@ -157,7 +159,8 @@
           if (phase < 3) {
             const t1 = s / len, t2 = segEnd / len;
             const P = lerp(p, q, t1), Q = lerp(p, q, t2), M1 = lerpM(m1, m2, t1), M2 = lerpM(m1, m2, t2);
-            this.quad(at(P, M1, off1, lift), at(P, M1, off2, lift), at(Q, M2, off2, lift), at(Q, M2, off1, lift), color, owner);
+            this.quad(at(P, M1, lerpOff(off1, i - 1, i, t1), lift), at(P, M1, lerpOff(off2, i - 1, i, t1), lift),
+              at(Q, M2, lerpOff(off2, i - 1, i, t2), lift), at(Q, M2, lerpOff(off1, i - 1, i, t2), lift), color, owner);
           }
           s = segEnd + 1e-6;
         }
@@ -169,7 +172,7 @@
       for (let i = 1; i < pts.length; i++) {
         const p = pts[i - 1], q = pts[i];
         if (minHeight != null && Math.max(p.y, q.y) < minHeight) continue;
-        const a = at(p, mit[i - 1], off, lift), b = at(q, mit[i], off, lift);
+        const a = at(p, mit[i - 1], ov(off, i - 1), lift), b = at(q, mit[i], ov(off, i), lift);
         this.quad(a, b, [b[0], b[1] - depth, b[2]], [a[0], a[1] - depth, a[2]], color);
       }
     }
@@ -240,29 +243,35 @@
 
     // ---- дороги для машин ----
     for (const w of ways.filter(isDrivable)) {
-      const pts = w.nodes.map((id) => P(doc.nodes.get(id), H(id)));
-      if (pts.length < 2) continue;
-      const mit = miters(pts);
+      const raw = w.nodes.map((id) => P(doc.nodes.get(id), H(id)));
+      if (raw.length < 2) continue;
       const lv = level(w);
-      const width = roadWidth(doc, w), half = width / 2;
-      const { f, b } = lanesSplit(doc, w);
-      const laneW = width / Math.max(f + b, 1);
-      roads.band(pts, mit, half, -half, 0.03, C(lv > 0 ? COLORS.asphaltBridge : lv < 0 ? COLORS.asphaltUnder : COLORS.asphalt), w.id);
+      const cs = doc.crossSection(w);
+      const { f, b, laneW } = cs;
+      const width = cs.width, half = width / 2;
+      // плавное сужение к продолжению дороги — как в 2D
+      const dn = root.OSM.densify(raw, 25, 4, "x", "z");
+      const pts = dn.pts;
+      const taper = Math.min(25, dn.total * 0.45);
+      const prof = dn.dist.map((s) => root.OSM.taperProfile(s, dn.total - s, cs, doc.endProfile(w, false), doc.endProfile(w, true), taper));
+      const L_ = prof.map((p) => p.left), R_ = prof.map((p) => p.right), A_ = prof.map((p) => p.axis);
+      const mit = miters(pts);
+      const add = (arr, d) => arr.map((v) => v + d);
+      roads.band(pts, mit, L_, R_, 0.03, C(lv > 0 ? COLORS.asphaltBridge : lv < 0 ? COLORS.asphaltUnder : COLORS.asphalt), w.id);
       summary.roads++;
       if (lv > 0) summary.bridges++;
       if (lv < 0) summary.tunnels++;
 
       // разметка: кромки, двойная осевая у двусторонних, прерывистые между полосами
-      marks.band(pts, mit, half - 0.25, half - 0.4, 0.07, white);
-      marks.band(pts, mit, -half + 0.4, -half + 0.25, 0.07, white);
+      marks.band(pts, mit, add(L_, -0.25), add(L_, -0.4), 0.07, white);
+      marks.band(pts, mit, add(R_, 0.4), add(R_, 0.25), 0.07, white);
       if (b > 0) {
-        const axis = half - b * laneW;
-        marks.band(pts, mit, axis + 0.22, axis + 0.08, 0.07, yellow);
-        marks.band(pts, mit, axis - 0.08, axis - 0.22, 0.07, yellow);
-        for (let k = 1; k < b; k++) marks.band(pts, mit, half - k * laneW + 0.07, half - k * laneW - 0.07, 0.07, white, null, true);
-        for (let k = 1; k < f; k++) marks.band(pts, mit, axis - k * laneW + 0.07, axis - k * laneW - 0.07, 0.07, white, null, true);
+        marks.band(pts, mit, add(A_, 0.22), add(A_, 0.08), 0.07, yellow);
+        marks.band(pts, mit, add(A_, -0.08), add(A_, -0.22), 0.07, yellow);
+        for (let k = 1; k < b; k++) { const o = A_.map((a, i) => Math.min(a + k * laneW, L_[i] - 0.3)); marks.band(pts, mit, add(o, 0.07), add(o, -0.07), 0.07, white, null, true); }
+        for (let k = 1; k < f; k++) { const o = A_.map((a, i) => Math.max(a - k * laneW, R_[i] + 0.3)); marks.band(pts, mit, add(o, 0.07), add(o, -0.07), 0.07, white, null, true); }
       } else {
-        for (let k = 1; k < f; k++) marks.band(pts, mit, half - k * laneW + 0.07, half - k * laneW - 0.07, 0.07, white, null, true);
+        for (let k = 1; k < f; k++) { const o = L_.map((l, i) => Math.max(l - k * laneW, R_[i] + 0.3)); marks.band(pts, mit, add(o, 0.07), add(o, -0.07), 0.07, white, null, true); }
         // стрелки направления на односторонних
         const dir = onewayDir(w) < 0 ? -1 : 1;
         for (let i = 1; i < pts.length; i++) {
@@ -280,11 +289,11 @@
       // мост: плита, борта, ограждение, опоры — там, где дорога поднята
       if (pts.some((p) => p.y > 0.5)) {
         const deck = C(COLORS.deck), rail = C(COLORS.railing), pil = C(COLORS.pillar);
-        struct.wall(pts, mit, half + 0.4, 0.03, 1.1, deck, 0.5);
-        struct.wall(pts, mit, -half - 0.4, 0.03, 1.1, deck, 0.5);
-        struct.band(pts.map((p) => ({ ...p, y: p.y - 1.07 })), mit, half + 0.4, -half - 0.4, 0, deck);
-        struct.wall(pts, mit, half + 0.4, 1.1, 1.07, rail, 0.5);
-        struct.wall(pts, mit, -half - 0.4, 1.1, 1.07, rail, 0.5);
+        struct.wall(pts, mit, add(L_, 0.4), 0.03, 1.1, deck, 0.5);
+        struct.wall(pts, mit, add(R_, -0.4), 0.03, 1.1, deck, 0.5);
+        struct.band(pts.map((p) => ({ ...p, y: p.y - 1.07 })), mit, add(L_, 0.4), add(R_, -0.4), 0, deck);
+        struct.wall(pts, mit, add(L_, 0.4), 1.1, 1.07, rail, 0.5);
+        struct.wall(pts, mit, add(R_, -0.4), 1.1, 1.07, rail, 0.5);
         for (let i = 1; i < pts.length; i++) {
           const p = pts[i - 1], q = pts[i], len = Math.hypot(q.x - p.x, q.z - p.z);
           for (let s = 0; s < len; s += 24) {

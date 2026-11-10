@@ -246,5 +246,96 @@
     return result;
   }
 
-  return { analyze, walkable, buildGraph, MAJOR, CROSSING_PENALTY_M };
+  /**
+   * Пешеходная доступность остановок: куда можно дойти от каждой остановки за minutes минут
+   * по пешеходной сети (скорость 4,5 км/ч). Если задан heightOf(nodeId) — учитывается уклон
+   * по функции Тоблера: в гору и под крутой уклон идут медленнее.
+   * Возвращает дуги в зоне доступности и долю зданий в ней.
+   */
+  function accessibility(doc, stops, opts) {
+    opts = Object.assign({ minutes: 5, speedKmh: 4.5 }, opts || {});
+    const { adj, unmarked } = buildGraph(doc);
+    const ids = [...adj.keys()];
+    if (!ids.length) return { edges: [], covered: 0, buildings: 0, perStop: [] };
+    const proj = projector(doc.nodes.get(ids[0]).lat);
+    const cell = 60, grid = new Map();
+    for (const id of ids) {
+      const p = proj(doc.nodes.get(id));
+      const k = Math.floor(p.x / cell) + ":" + Math.floor(p.y / cell);
+      if (!grid.has(k)) grid.set(k, []);
+      grid.get(k).push({ id, p });
+    }
+    const snap = (lat, lon, maxM) => {
+      const p = proj({ lat, lon });
+      const cx = Math.floor(p.x / cell), cy = Math.floor(p.y / cell);
+      let best = null;
+      for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) {
+        for (const q of grid.get(cx + dx + ":" + (cy + dy)) || []) {
+          const d = Math.hypot(p.x - q.p.x, p.y - q.p.y);
+          if (d <= maxM && (!best || d < best.d)) best = { id: q.id, d };
+        }
+      }
+      return best;
+    };
+    const budget = opts.minutes * 60; // секунды
+    const flat = (opts.speedKmh * 1000) / 3600;
+    // Тоблер: v = 6·e^(−3.5·|s+0.05|) км/ч, нормируем к ровной поверхности
+    const tobler = (slope) => Math.exp(-3.5 * Math.abs(slope + 0.05)) / Math.exp(-3.5 * 0.05);
+    const timeOf = (a, b, len) => {
+      let v = flat;
+      if (opts.heightOf) {
+        const ha = opts.heightOf(a), hb = opts.heightOf(b);
+        if (ha != null && hb != null && len > 1) v *= tobler((hb - ha) / len);
+      }
+      return len / v + (unmarked.has(b) ? 20 : 0); // переход магистрали вне разметки — ждём просвета
+    };
+    const best = new Map(); // узел -> оставшееся время
+    const perStop = [];
+    for (const st of stops) {
+      const s0 = snap(st.lat, st.lon, 120);
+      if (!s0) { perStop.push({ id: st.id, reached: 0 }); continue; }
+      const start = budget - s0.d / flat;
+      const dist = new Map([[s0.id, start]]);
+      const queue = [[start, s0.id]];
+      let reached = 0;
+      while (queue.length) {
+        // простая очередь с приоритетом по оставшемуся времени (графы небольшие)
+        let bi = 0;
+        for (let i = 1; i < queue.length; i++) if (queue[i][0] > queue[bi][0]) bi = i;
+        const [left, v] = queue.splice(bi, 1)[0];
+        if (left < (dist.get(v) ?? -1)) continue;
+        reached++;
+        if ((best.get(v) ?? -1) < left) best.set(v, left);
+        for (const e of adj.get(v) || []) {
+          const nl = left - timeOf(v, e.to, e.len);
+          if (nl > 0 && nl > (dist.get(e.to) ?? -1)) { dist.set(e.to, nl); queue.push([nl, e.to]); }
+        }
+      }
+      perStop.push({ id: st.id, reached });
+    }
+    // дуги зоны: оба конца достижимы
+    const edges = [];
+    const seen = new Set();
+    for (const [v, left] of best) {
+      for (const e of adj.get(v) || []) {
+        const key = v < e.to ? v + "|" + e.to : e.to + "|" + v;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (best.has(e.to)) edges.push([v, e.to, Math.max(left, best.get(e.to)) / budget]);
+      }
+    }
+    // здания: центр в 60 м от узла зоны
+    let buildings = 0, covered = 0;
+    for (const w of doc.ways.values()) {
+      if (!w.tags.building || w.nodes.length < 3) continue;
+      buildings++;
+      let lat = 0, lon = 0;
+      for (const id of w.nodes) { const n = doc.nodes.get(id); lat += n.lat; lon += n.lon; }
+      const near = snap(lat / w.nodes.length, lon / w.nodes.length, 60);
+      if (near && best.has(near.id)) covered++;
+    }
+    return { edges, covered, buildings, perStop, minutes: opts.minutes };
+  }
+
+  return { analyze, walkable, buildGraph, accessibility, MAJOR, CROSSING_PENALTY_M };
 });
